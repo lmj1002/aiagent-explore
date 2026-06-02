@@ -1,20 +1,40 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: ''
+name: Feature Request
+about: 提出新功能、改进或 Bug 修复请求
+title: "[Feature] 简短描述"
 labels: ''
 assignees: ''
-
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## 背景
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+<!-- 为什么要做这个改动？业务场景是什么？ -->
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## 当前问题
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+<!-- 现状有什么痛点？影响范围多大？如果是 Bug，请附上复现步骤。 -->
+
+## 目标
+
+<!-- 期望达到什么效果？怎么衡量成功？ -->
+
+## 技术限制
+
+<!-- 有哪些不可突破的约束？例如：接口返回结构不能变、性能不能下降、依赖版本限制等。 -->
+
+## 验收标准
+
+<!-- 完成后如何验证？建议用 checklist： -->
+<!-- - [ ] 功能 A 正常可用 -->
+<!-- - [ ] 响应时间 < 500ms -->
+<!-- - [ ] 单元测试通过 -->
+
+## 涉及模块
+
+<!-- 预估涉及的文件路径或模块名，帮助自动分析定位： -->
+<!-- - src/services/xxx.ts -->
+<!-- - src/components/yyy.vue -->
+
+## 优先级
+
+<!-- P0=紧急 / P1=高 / P2=中 / P3=低 -->
