@@ -12,8 +12,10 @@ Usage:
 import argparse
 import os
 import shutil
+import sys
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.messages import HumanMessage
@@ -24,13 +26,33 @@ from langchain_openai import ChatOpenAI
 
 def load_llm() -> ChatOpenAI:
     """从项目根目录 .env 加载 LLM 配置，默认使用本地 Ollama qwen3.5:2b"""
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-    return ChatOpenAI(
-        model=os.getenv("MODEL", "qwen3.5:2b"),
-        base_url=os.getenv("BASE_URL", "http://localhost:11434/v1/"),
-        api_key=os.getenv("API_KEY", "ollama"),
-        temperature=0,
-    )
+    load_dotenv(Path(__file__).resolve().parents[3] / ".env")
+
+    try:
+        # 创建绕过代理的 httpx 客户端，避免本地 Ollama 请求被代理劫持
+        timeout = httpx.Timeout(
+            float(os.getenv("LLM_TIMEOUT", "120")),
+            connect=10.0,
+        )
+        http_client = httpx.Client(proxy=None, timeout=timeout)
+
+        llm = ChatOpenAI(
+            model=os.getenv("MODEL", "qwen3.5:2b"),
+            base_url=os.getenv("BASE_URL", "http://localhost:11434/v1/"),
+            api_key=os.getenv("API_KEY", "ollama"),
+            temperature=0,
+            max_retries=int(os.getenv("LLM_MAX_RETRIES", "2")),
+            http_client=http_client,
+        )
+        print(f"[load_llm] 模型: {llm.model_name}, base_url: {llm.openai_api_base}")
+        return llm
+    except Exception as e:
+        print(f"\n❌ LLM 初始化失败: {e}")
+        print("   请检查:")
+        print("   1. Ollama 是否已启动 (默认 http://localhost:11434)")
+        print("   2. 模型是否已下载 (默认 qwen3.5:2b)")
+        print("   3. 代理设置是否正常 (HTTPS_PROXY / HTTP_PROXY)")
+        sys.exit(1)
 
 
 # ============================== 目录 & 数据准备 ==============================

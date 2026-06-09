@@ -175,22 +175,22 @@ agent = create_agent(
 # 3. 运行指定步骤
 
 # 运行 Step 1（最小化 Agent）
-python langchain/buildADeepAgentFromScratch/agent.py --step 1
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 1
 
 # 运行 Step 2（文件系统）
-python langchain/buildADeepAgentFromScratch/agent.py --step 2
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 2
 
 # 运行 Step 3（上下文压缩）
-python langchain/buildADeepAgentFromScratch/agent.py --step 3
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 3
 
 # 运行 Step 4（技能系统）
-python langchain/buildADeepAgentFromScratch/agent.py --step 4
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 4
 
 # 运行 Step 5（完整版，默认）
-python langchain/buildADeepAgentFromScratch/agent.py --step 5
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 5
 
 # 使用自定义任务
-python langchain/buildADeepAgentFromScratch/agent.py --step 5 --task "读取 sales_data.csv，计算每种产品的收入占比，生成饼图"
+python langchain/langchain2/buildADeepAgentFromScratch/agent.py --step 5 --task "读取 sales_data.csv，计算每种产品的收入占比，生成饼图"
 ```
 
 **环境变量配置（`.env`）：**

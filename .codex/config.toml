@@ -1,0 +1,7 @@
+[shell_environment_policy]
+inherit = "core"
+
+[shell_environment_policy.set]
+PATH = "/c/Program Files/GitHub CLI:$PATH"
+HTTPS_PROXY = "http://127.0.0.1:8889"
+HTTP_PROXY = "http://127.0.0.1:8889"
