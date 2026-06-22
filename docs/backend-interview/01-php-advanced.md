@@ -85,7 +85,7 @@ PHP 8.4 (2024-11)
 **Q1: 解释 PHP 类型弱化的工作原理，写出以下代码输出并说明原因。**
 
 ```php
-var_dump(0 == 'abc');    // PHP 8: false (PHP 7: true 因类型转换)
+var_dump(0 == 'abc');    // PHP 7: true（'abc'→0, 0==0）；PHP 8: false（0→'0', '0'!='abc'）
 var_dump('1e1' == '10'); // true — 字符串数值比较
 var_dump([] == 0);       // false (PHP 8 变更)
 var_dump(null == 0);     // false (PHP 8 变更)

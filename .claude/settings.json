@@ -1,0 +1,6 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "bash \"F:\\study\\aiagent-explore\\.claude\\statusline.sh\""
+  }
+}
