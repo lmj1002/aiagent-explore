@@ -62,19 +62,14 @@ Partition 数量确定原则：
 
 `kafka.log.Log` 是 Partition 的日志表示，每个 Partition 对应一个目录（`<topic>-<partitionId>`），内部包含多个 LogSegment：
 
-```java
-// kafka.log.Log.scala
-class Log(
-  val dir: File,           // 日志目录: /data/kafka/topics/my-topic-0/
-  config: LogConfig,
-  recoveryPoint: Long = 0L,
-  scheduler: Scheduler,
-  time: Time,
-  topicPartition: TopicPartition,
-  producerStateManager: ProducerStateManager  // 幂等/事务状态管理
-) extends Logging with LogRecovery {
-  private val segments: ConcurrentNavigableMap[java.lang.Long, LogSegment]
-  // ...
+```go
+// 等价概念（Go 伪代码，对应 Kafka Scala 源码 kafka.log.Log）
+type PartitionLog struct {
+    Dir                  string            // 日志目录: /data/kafka/topics/my-topic-0/
+    Config               LogConfig
+    RecoveryPoint        int64
+    Segments             map[int64]*LogSegment // baseOffset → Segment
+    ProducerStateManager *ProducerStateManager // 幂等/事务状态管理
 }
 ```
 
@@ -230,19 +225,16 @@ Kafka 使用 `sendfile`（`FileChannel.transferTo`）后的路径：
 
 **关键代码：**
 
-```java
-// kafka.network.Processor 或 Kafka 消费者的 FetchRequest 处理
-// 底层调用 Java NIO FileChannel.transferTo(position, count, socketChannel)
-// Windows 下基于 TransmitFile，Linux 下基于 sendfile
-override def writeTo(channel: GatheringByteChannel, offset: Long, length: Int): Long = {
-  channel match {
-    case fileChannel: FileChannel =>
-      // Scala 直接调用 Java NIO 的 transferTo
-      fileChannel.transferTo(position, length, channel)
-    case _ =>
-      super.writeTo(channel, offset, length)
-  }
-}
+```go
+// 零拷贝核心：Linux sendfile 系统调用（Go net 包底层自动使用）
+// 等价于 Java NIO FileChannel.transferTo()
+// Go 中通过 os.File + net.Conn 组合，运行时自动选择 sendfile
+f, _ := os.Open(logSegmentPath)
+defer f.Close()
+// net.Conn.ReadFrom(f) 内部触发 sendfile，数据不经过用户态
+conn.(io.ReaderFrom).ReadFrom(f)
+
+// 路径：磁盘 →(DMA)→ 内核页缓存 →(sendfile)→ 网卡，跳过用户态拷贝
 ```
 
 **生产最佳实践：**
@@ -324,15 +316,15 @@ Producer 实例
 
 **原理：**
 
-```java
-// Producer 请求中携带的协议字段
-// ProducerRequest
-{
-  producerId: long,          // 服务端分配的 PID（首次请求返回）
-  producerEpoch: short,      // 每次 Producer 初始化递增
-  sequenceNumber: int,       // 按 Partition 单调递增，从 0 开始
-  data: RecordBatch[]
+```go
+// 幂等 Producer 请求协议字段（伪代码，对应 Kafka ProducerRequest）
+type ProducerRequest struct {
+    ProducerID     int64         // 服务端分配的 PID（首次请求返回）
+    ProducerEpoch  int16         // 每次 Producer 初始化递增，用于 fencing 旧 Producer
+    SequenceNumber int32         // 按 Partition 单调递增，从 0 开始
+    Data           []RecordBatch
 }
+// Broker 端：接受条件 sequenceNumber == expectedSeq+1，否则拒绝（重复或乱序）
 ```
 
 - Broker 端维护 `<PID, Partition>` 维度的 `sequenceNumber` 状态
@@ -365,16 +357,20 @@ isolation.level=read_committed        # 只消费已提交事务消息
 
 **事务 API：**
 
-```java
-producer.initTransactions();
-try {
-    producer.beginTransaction();
-    producer.send(new ProducerRecord<>("topic-a", key, value));
-    producer.send(new ProducerRecord<>("topic-b", key, value));
-    producer.sendOffsetsToTransaction(offsets, consumerGroup);
-    producer.commitTransaction();
-} catch (Exception e) {
-    producer.abortTransaction();
+```go
+// Go kafka 客户端事务示例（使用 IBM/sarama 库）
+producer, _ := sarama.NewSyncProducer(brokers, config) // config.Producer.Transaction.ID = "my-tx-id"
+
+producer.BeginTxn()
+producer.SendMessage(&sarama.ProducerMessage{Topic: "topic-a", Key: sarama.StringEncoder(key), Value: sarama.ByteEncoder(value)})
+producer.SendMessage(&sarama.ProducerMessage{Topic: "topic-b", Key: sarama.StringEncoder(key), Value: sarama.ByteEncoder(value)})
+// 将消费者偏移量纳入事务（消费-转发场景）
+producer.AddOffsetsToTxn(offsets, consumerGroup)
+
+if err != nil {
+    producer.AbortTxn() // 回滚
+} else {
+    producer.CommitTxn() // 提交
 }
 ```
 
@@ -520,20 +516,19 @@ class GroupCoordinator(
 
 A: 推荐模式：正常处理循环使用 `commitAsync`，关闭 Consumer 前的最终提交使用 `commitSync`。
 
-```java
-try {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(1000));
-    // ... 处理消息
-    consumer.commitAsync();  // 快速非阻塞
-} catch (Exception e) {
-    // 处理异常
-} finally {
-    try {
-        consumer.commitSync();  // 确保最终提交完成
-    } finally {
-        consumer.close();
-    }
+```go
+// 正常循环用异步提交（非阻塞，高吞吐）
+for {
+    records, _ := consumer.ReadMessage(ctx)
+    process(records)
+    consumer.CommitOffsets() // sarama: 异步批量提交
 }
+
+// 关闭前用同步提交确保最终偏移量落地
+defer func() {
+    consumer.CommitOffsets() // 同步等待完成
+    consumer.Close()
+}()
 ```
 
 ### 4.4 再均衡监听器（RebalanceListener）
@@ -544,25 +539,38 @@ try {
 
 A: 使用 `ConsumerRebalanceListener`，在分区撤销前（`onPartitionsRevoked`）提交偏移量，在分区分配后（`onPartitionsAssigned`）重新初始化资源。
 
-```java
-consumer.subscribe(Collections.singletonList("topic"), new ConsumerRebalanceListener() {
-    @Override
-    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
-        // Rebalance 前提交偏移量，防止重复消费
-        consumer.commitSync(currentOffsets);
-        // 清理分区相关资源（如本地状态窗口、数据库连接）
-    }
+```go
+// sarama ConsumerGroup Handler 实现再均衡回调
+type orderHandler struct {
+    currentOffsets map[string][]*sarama.PartitionOffsetManager
+}
 
-    @Override
-    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
-        // 新分区分配后，初始化分区相关资源
-        for (TopicPartition partition : partitions) {
-            // 从外部存储恢复该分区的处理状态
-            long offset = externalStore.readOffset(partition);
-            consumer.seek(partition, offset);
+// Rebalance 前触发：提交偏移量防止重复消费
+func (h *orderHandler) Cleanup(sess sarama.ConsumerGroupSession) error {
+    sess.Commit() // 提交当前所有偏移量
+    // 清理分区相关资源（本地状态、数据库连接等）
+    return nil
+}
+
+// 新分区分配后触发：恢复处理状态
+func (h *orderHandler) Setup(sess sarama.ConsumerGroupSession) error {
+    for _, partitions := range sess.Claims() {
+        for _, partition := range partitions {
+            // 从外部存储恢复偏移量，覆盖 Broker 端记录
+            offset := externalStore.ReadOffset(partition)
+            sess.ResetOffset("topic", partition, offset, "")
         }
     }
-});
+    return nil
+}
+
+func (h *orderHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+    for msg := range claim.Messages() {
+        process(msg)
+        sess.MarkMessage(msg, "") // 标记消费，下次 Commit 生效
+    }
+    return nil
+}
 ```
 
 **生产最佳实践：**

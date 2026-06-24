@@ -196,21 +196,32 @@ Producer ──publish──► RabbitMQ ──persist──► Disk
 | 批量 Confirm | 累积 N 条或间隔时间批量确认 | 中 |
 | 异步 Confirm | 回调监听 ack/nack，高并发推荐 | 高 |
 
-**核心代码模式（Java Spring Boot）**：
+**核心代码模式（Go amqp091）**：
 
-```java
-// 开启确认
-spring.rabbitmq.publisher-confirm-type=correlated  // 或 simple
-spring.rabbitmq.publisher-returns=true
+```go
+conn, _ := amqp.Dial("amqp://guest:guest@localhost:5672/")
+ch, _ := conn.Channel()
 
-// 异步确认回调
-rabbitTemplate.setConfirmCallback((correlationData, ack, cause) -> {
-    if (ack) {
-        // 确认成功，移除缓存
-    } else {
-        // 确认失败，记录日志 + 重试入死信队列
+// 开启 Publisher Confirm 模式
+ch.Confirm(false)
+confirms := ch.NotifyPublish(make(chan amqp.Confirmation, 1))
+
+ch.Publish("order.exchange", "order.created", false, false, amqp.Publishing{
+    ContentType:  "application/json",
+    DeliveryMode: amqp.Persistent,
+    Body:         body,
+})
+
+// 异步监听 ack/nack
+go func() {
+    for confirm := range confirms {
+        if confirm.Ack {
+            // 确认成功，移除本地缓存
+        } else {
+            // nack：记录日志 + 重试
+        }
     }
-});
+}()
 ```
 
 **实战踩坑**：
@@ -225,7 +236,183 @@ Q: Confirm 模式的 ack 是在消息写入磁盘前还是后？
 A: 取决于 `persistent` 配置和 `queue.declare` 的持久化设置。默认持久化消息在写入磁盘后才 ack（同步刷盘），性能版可通过 `spring.rabbitmq.publisher-confirm-type=simple` + 异步批量来平衡。
 
 Q: 如果 Confirm ack 丢失怎么办？  
-A: 生产者侧维护一个未确认消息的本地缓存（ConcurrentHashMap + 定时扫描），超时未确认则重发。配合幂等消费端实现"至少一次"语义。
+A: 生产者侧维护一个未确认消息的本地缓存（Map + 定时扫描），超时未确认则重发。配合幂等消费端实现"至少一次"语义。完整实现链路如下。
+
+#### 可靠生产者完整实现（At-Least-Once）
+
+**整体链路：**
+
+```
+生产者                    RabbitMQ Broker              消费者
+  │                              │                        │
+  ├─ Publish(msg, corrID) ──────►│                        │
+  ├─ pending[corrID] = {msg,now} │                        │
+  │                              ├─ 落盘/路由 ───────────►│
+  │  ◄── ack(corrID) ────────────┤                        ├─ 幂等检查
+  ├─ delete pending[corrID]      │                        ├─ 业务处理
+  │                              │                        └─ ack
+  │  ◄── nack(corrID) ───────────┤ （broker 拒绝）
+  ├─ 立即重发
+  │
+  │ [定时扫描 goroutine：每 5s]
+  ├─ age > 30s → 重发
+  └─ retryCount > 3 → 告警/写死信
+```
+
+**数据结构：**
+
+```go
+// 待确认消息条目
+type pendingMsg struct {
+    exchange   string
+    routingKey string
+    body       []byte
+    publishAt  time.Time // 发布时间，用于超时判断
+    retryCount int
+}
+
+// 可靠生产者
+type ReliableProducer struct {
+    ch          *amqp.Channel
+    confirms    <-chan amqp.Confirmation
+    pending     sync.Map // corrID(string) → *pendingMsg
+    tagToCorrID sync.Map // deliveryTag(uint64) → corrID(string)
+    seq         uint64   // 镜像 channel 的 deliveryTag 计数器
+    mu          sync.Mutex
+    timeout     time.Duration // 超时阈值，默认 30s
+    maxRetry    int           // 最大重试次数
+}
+```
+
+**初始化 + 发布：**
+
+```go
+func NewReliableProducer(ch *amqp.Channel) *ReliableProducer {
+    ch.Confirm(false) // 开启 Confirm 模式
+    p := &ReliableProducer{
+        ch:       ch,
+        confirms: ch.NotifyPublish(make(chan amqp.Confirmation, 256)),
+        timeout:  30 * time.Second,
+        maxRetry: 3,
+    }
+    go p.listenConfirms() // 监听 broker 的 ack/nack（实时路径）
+    go p.scanExpired()    // 定时扫描超时消息（兜底路径）
+    return p
+}
+
+func (p *ReliableProducer) Publish(exchange, routingKey string, body []byte) {
+    corrID := uuid.New().String()
+
+    // 记录 deliveryTag → corrID 的映射（channel 内单调递增）
+    p.mu.Lock()
+    p.seq++
+    tag := p.seq
+    p.mu.Unlock()
+
+    p.tagToCorrID.Store(tag, corrID)
+    p.pending.Store(corrID, &pendingMsg{
+        exchange: exchange, routingKey: routingKey,
+        body: body, publishAt: time.Now(),
+    })
+    p.ch.Publish(exchange, routingKey, false, false, amqp.Publishing{
+        DeliveryMode:  amqp.Persistent,
+        CorrelationId: corrID, // 传给消费者，用于幂等去重
+        Body:          body,
+    })
+}
+```
+
+> **为什么需要 `tagToCorrID`？**  
+> `amqp.Confirmation` 只携带单调递增的 `DeliveryTag`，没有 `CorrelationId`。必须维护一张 `deliveryTag → corrID` 的映射才能反查到原始消息。
+
+**确认监听（实时路径）：**
+
+```go
+func (p *ReliableProducer) listenConfirms() {
+    for confirm := range p.confirms {
+        raw, ok := p.tagToCorrID.LoadAndDelete(confirm.DeliveryTag)
+        if !ok {
+            continue
+        }
+        corrID := raw.(string)
+        if confirm.Ack {
+            p.pending.Delete(corrID) // ✅ 正常确认，清除缓存
+        } else {
+            p.retryByCorrID(corrID) // ❌ nack，立即重发
+        }
+    }
+}
+```
+
+**定时扫描（兜底路径）：**
+
+```go
+func (p *ReliableProducer) scanExpired() {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+    for range ticker.C {
+        p.pending.Range(func(k, v any) bool {
+            corrID, msg := k.(string), v.(*pendingMsg)
+            if time.Since(msg.publishAt) < p.timeout {
+                return true // 未超时，继续遍历
+            }
+            if msg.retryCount >= p.maxRetry {
+                // 超过最大重试：告警 + 落库死信，人工介入
+                log.Printf("[WARN] msg %s dropped after %d retries", corrID, msg.retryCount)
+                p.pending.Delete(corrID)
+                return true
+            }
+            p.retryByCorrID(corrID)
+            return true
+        })
+    }
+}
+
+func (p *ReliableProducer) retryByCorrID(corrID string) {
+    raw, ok := p.pending.Load(corrID)
+    if !ok {
+        return
+    }
+    msg := raw.(*pendingMsg)
+    msg.retryCount++
+    p.pending.Delete(corrID)          // 删除旧条目
+    p.Publish(msg.exchange, msg.routingKey, msg.body) // 重发（生成新 corrID）
+}
+```
+
+**消费者幂等闭环：**
+
+```go
+// CorrelationId 写入去重表，唯一索引冲突 = 重复消息
+func handleMessage(msg amqp.Delivery, db *sql.DB) {
+    result, err := db.Exec(
+        "INSERT IGNORE INTO msg_dedup(corr_id, created_at) VALUES(?, NOW())",
+        msg.CorrelationId,
+    )
+    if err != nil || mustInt(result.RowsAffected()) == 0 {
+        msg.Ack(false) // 重复消息，ack 丢弃
+        return
+    }
+    if err := processBusiness(msg.Body); err != nil {
+        msg.Nack(false, true) // 业务失败，requeue 重试
+        return
+    }
+    msg.Ack(false)
+}
+```
+
+**各环节职责说明：**
+
+| 组件 | 职责 |
+|------|------|
+| `listenConfirms()` | 处理 broker 实时 ack/nack，正常路径，延迟最低 |
+| `scanExpired()` | 兜底路径，处理 ack 丢失/网络抖动/broker 重启等异常场景 |
+| `retryByCorrID()` | 统一重发逻辑，两条路径共用，避免重复代码 |
+| `msg_dedup` 表 | 消费端幂等，用 DB 唯一索引承接重复投递，去重+业务在同一事务内 |
+
+> **At-Least-Once 语义的完整保证**：  
+> 生产侧 — 未确认消息一定重发（实时 nack + 超时扫描双保险）；  
+> 消费侧 — 重复消息通过幂等去重，业务只执行一次。
 
 ---
 
@@ -247,17 +434,15 @@ A: 生产者侧维护一个未确认消息的本地缓存（ConcurrentHashMap + 
 spring.rabbitmq.listener.simple.acknowledge-mode=manual
 ```
 
-```java
-@RabbitListener(queues = "order.queue")
-public void handle(Message message, Channel channel, @Header(AmqpHeaders.DELIVERY_TAG) long tag) {
-    try {
-        process(message);
-        channel.basicAck(tag, false);       // 单条确认
-        // channel.basicAck(tag, true);     // 批量确认该 tag 之前的所有消息
-    } catch (BusinessException e) {
-        channel.basicNack(tag, false, true);  // requeue=true，放回队列
-    } catch (DeadLetterException e) {
-        channel.basicNack(tag, false, false); // requeue=false，进死信
+```go
+msgs, _ := ch.Consume("order.queue", "", false, false, false, false, nil)
+for msg := range msgs {
+    if err := process(msg.Body); err == nil {
+        msg.Ack(false)                    // 单条确认
+    } else if isBusinessErr(err) {
+        msg.Nack(false, false)            // 永久故障 requeue=false，进死信
+    } else {
+        msg.Nack(false, true)             // 临时故障 requeue=true，放回队列
     }
 }
 ```
@@ -410,23 +595,31 @@ A: 读路径多了磁盘 I/O，延迟比内存队列高一个数量级。适合"
               └──────────────────────┘
 ```
 
+**工作流程说明**：
+
+1. **声明阶段**：在原始队列（`order.queue`）上配置两个关键参数：`x-dead-letter-exchange`（指定死信去哪个 Exchange）和 `x-dead-letter-routing-key`（死信的路由键）。DLX 本身是一个普通的 Exchange，DLQ 也是一个普通的 Queue，只是在业务上专门用于接收"失败消息"。
+
+2. **消息变成死信的三种触发条件**：
+   - **TTL 过期**：消息在队列中停留时间超过 `x-message-ttl` 设置的毫秒数；
+   - **队列满**：队列中消息数量达到 `x-max-length` 上限，队头消息被挤出；
+   - **消费者主动拒绝**：消费者调用 `Nack` 或 `Reject`，且 `requeue=false`。
+
+3. **路由阶段**：消息变成死信后，RabbitMQ 自动将其投递到原队列配置的 DLX，并附上 `x-death` header（记录死亡原因、原队列名、死亡时间、死亡次数）。DLX 按照 `x-dead-letter-routing-key` 将消息路由到 DLQ。
+
+4. **处理阶段**：DLQ 的消费者负责集中处理失败消息——可以人工审查、记录日志、发告警，或按业务逻辑决定是否重新投递回原队列（注意避免死循环）。
+
 **配置示例**：
 
-```java
-@Bean
-public Queue orderQueue() {
-    return QueueBuilder.durable("order.queue")
-            .withArgument("x-dead-letter-exchange", "order.dlx.exchange")
-            .withArgument("x-dead-letter-routing-key", "order.dead")
-            .withArgument("x-message-ttl", 60000)
-            .withArgument("x-max-length", 10000)
-            .build();
-}
-
-@Bean
-public Queue deadLetterQueue() {
-    return QueueBuilder.durable("order.dlq.queue").build();
-}
+```go
+// 声明带死信参数的队列
+ch.QueueDeclare("order.queue", true, false, false, false, amqp.Table{
+    "x-dead-letter-exchange":    "order.dlx.exchange",
+    "x-dead-letter-routing-key": "order.dead",
+    "x-message-ttl":             int32(60000),
+    "x-max-length":              int32(10000),
+})
+// 声明死信队列
+ch.QueueDeclare("order.dlq.queue", true, false, false, false, nil)
 ```
 
 **实战经验**：
@@ -456,21 +649,15 @@ A: 死信消息重新投递到原始队列时，会保留原有 header 和 deliv
 
 **缺点**：不精确（队列首条 TTL 到期才判断后续消息、死信时间精度为秒级）、不灵活（每档延迟需独立队列）。
 
-```java
-// 定义多个延迟等级
-@Bean
-public Queue delay5s() {
-    return QueueBuilder.durable("delay.5s")
-            .withArgument("x-message-ttl", 5000)
-            .withArgument("x-dead-letter-exchange", "process.exchange")
-            .build();
-}
-@Bean
-public Queue delay30s() {
-    return QueueBuilder.durable("delay.30s")
-            .withArgument("x-message-ttl", 30000)
-            .withArgument("x-dead-letter-exchange", "process.exchange")
-            .build();
+```go
+// 声明多档延迟等级队列（TTL + DLX 方案）
+for _, ttl := range []struct{ name string; ms int32 }{
+    {"delay.5s", 5000}, {"delay.30s", 30000},
+} {
+    ch.QueueDeclare(ttl.name, true, false, false, false, amqp.Table{
+        "x-message-ttl":          ttl.ms,
+        "x-dead-letter-exchange": "process.exchange",
+    })
 }
 ```
 
@@ -481,13 +668,14 @@ Producer ──► Delayed Exchange ──hold──► Timer ──► Consumer
              (插件实现)        (x-delay 到期)
 ```
 
-```java
-// 消息头设置延迟
-MessagePostProcessor processor = msg -> {
-    msg.getMessageProperties().setDelay(5000);  // 5 秒, 单位 ms
-    return msg;
-};
-rabbitTemplate.convertAndSend("delayed.exchange", "routing.key", payload, processor);
+```go
+// 消息头设置延迟（rabbitmq_delayed_message_exchange 插件）
+ch.Publish("delayed.exchange", "routing.key", false, false, amqp.Publishing{
+    ContentType:  "application/json",
+    DeliveryMode: amqp.Persistent,
+    Headers:      amqp.Table{"x-delay": int32(5000)}, // 延迟 5000ms
+    Body:         payload,
+})
 ```
 
 **优势**：单 Exchange 支持任意延迟时间（1ms 以上），精确度高。  
@@ -513,22 +701,108 @@ A: 推荐双层延迟方案：
                        （消费丢弃） （取消订单）
 ```
 
-注意：TTL 30 分钟的消息若提前支付，需要发送一个"取消"信号到状态查询队列，或用 Redis 标记已支付。
+TTL 消息一旦入队无法撤回，30 分钟后必然到达消费者。若用户提前支付，需在消费者侧判断"该订单是否已支付"，有两种方案。
+
+#### 方案一：发送取消信号到状态查询队列
+
+**思路**：支付成功后，主动往状态查询队列投一条 `PAID` 信号消息，消费者处理两种消息类型，用 Redis 做状态协调。
+
+```
+用户下单 ──► order.wait（TTL=30min）──► DLX ──► order.check.queue ──► 消费者
+                                                        ▲
+用户支付 ──► payment service ──────────────────────────┘
+                              （发一条 type=PAID 的信号消息）
+```
+
+```go
+type CheckMsg struct {
+    OrderID string `json:"order_id"`
+    Type    string `json:"type"` // "TIMEOUT" 或 "PAID"
+}
+
+func handleCheckQueue(msg amqp.Delivery) {
+    var m CheckMsg
+    json.Unmarshal(msg.Body, &m)
+
+    switch m.Type {
+    case "PAID":
+        // 支付信号：写 Redis 标记，供后续 TIMEOUT 消息查询
+        rdb.Set(ctx, "order:paid:"+m.OrderID, "1", 2*time.Hour)
+        msg.Ack(false)
+    case "TIMEOUT":
+        val, _ := rdb.Get(ctx, "order:paid:"+m.OrderID).Result()
+        if val == "1" {
+            msg.Ack(false)
+            return
+        }
+        // Redis 无标记，降级查 DB（防止 PAID 信号延迟或 Redis 故障）
+        if db.QueryOrder(m.OrderID).Status == "PAID" {
+            msg.Ack(false)
+            return
+        }
+        cancelOrder(m.OrderID)
+        msg.Ack(false)
+    }
+}
+```
+
+**风险点**：极端场景下 `PAID` 信号可能晚于 `TIMEOUT` 到达（MQ 延迟），因此 `TIMEOUT` 分支必须降级查 DB 兜底。
+
+#### 方案二：Redis 原子标记（推荐）
+
+**思路**：支付成功时直接写 Redis 标记，消费者处理 TIMEOUT 消息时查 Redis 即可，无需额外 MQ 消息。
+
+```
+用户下单 ──► order.wait（TTL=30min）──► DLX ──► order.check.queue ──► 消费者
+                                                                        │查
+用户支付 ──► payment service ──► Redis SET order:paid:{orderId}  ◄──────┘
+```
+
+```go
+// 支付成功回调
+func onPaymentSuccess(orderID string) {
+    rdb.Set(ctx, "order:paid:"+orderID, "1", 2*time.Hour) // TTL 略大于订单 30min
+    updateOrderStatus(orderID, "PAID")
+}
+
+// 消费者只处理 TIMEOUT 消息
+func handleTimeout(msg amqp.Delivery) {
+    orderID := extractOrderID(msg.Body)
+    paid, _ := rdb.Exists(ctx, "order:paid:"+orderID).Result()
+    if paid > 0 {
+        msg.Ack(false)
+        return
+    }
+    cancelOrder(orderID)
+    msg.Ack(false)
+}
+```
+
+#### 两种方案对比
+
+| 维度 | 方案一（取消信号） | 方案二（Redis 标记） |
+|------|-------------------|---------------------|
+| 实现复杂度 | 高（两种消息类型） | 低（逻辑简单） |
+| Redis 依赖 | 用于状态协调，可降级查 DB | 强依赖，需降级兜底 |
+| 时序风险 | PAID 信号可能晚于 TIMEOUT | 几乎无（写标记在支付时同步完成） |
+| 额外 MQ 流量 | 每笔支付多一条信号消息 | 无 |
+
+**生产推荐方案二**，配合 `Redis + 降级查 DB` 双重兜底覆盖 Redis 故障场景。方案一适合希望通过 MQ 解耦、消费者不直接操作 Redis 的架构。
 
 ---
 
 ### 3.3 优先级队列
 
-```java
-@Bean
-public Queue priorityQueue() {
-    return QueueBuilder.durable("order.priority")
-            .withArgument("x-max-priority", 10)  // 0-255, 推荐 ≤10
-            .build();
-}
-
+```go
+// 声明优先级队列
+ch.QueueDeclare("order.priority", true, false, false, false, amqp.Table{
+    "x-max-priority": int32(10), // 0-255，推荐 ≤10
+})
 // 发送时设置优先级
-messageProps.setPriority(5);
+ch.Publish("", "order.priority", false, false, amqp.Publishing{
+    Priority: 5,
+    Body:     body,
+})
 ```
 
 **使用限制**：
@@ -734,27 +1008,26 @@ spring.rabbitmq:
 
 ### 5.2 批量发送
 
-```java
-// 方案一：Batched messages (Spring 4.1+)
-@Bean
-public BatchingStrategy batchStrategy() {
-    return new SimpleBatchingStrategy(
-        100,                    // batchSize：消息条数
-        16384,                  // bufferLimit：字节上限
-        10000                   // timeout：ms，超时即发
-    );
-}
+```go
+// 批量发送：在同一 Channel 内连续 Publish，最后等待所有 Confirm
+ch.Confirm(false)
+confirms := ch.NotifyPublish(make(chan amqp.Confirmation, len(batch)))
 
-// 方案二：手动批量
-List<Message> batch = new ArrayList<>();
-// ... 收集消息
-rabbitTemplate.invoke(operations -> {
-    for (Message msg : batch) {
-        operations.convertAndSend(exchange, routingKey, msg);
+for _, msg := range batch {
+    ch.Publish(exchange, routingKey, false, false, amqp.Publishing{
+        DeliveryMode: amqp.Persistent,
+        Body:         msg,
+    })
+}
+// 等待全部 ack（超时 5s）
+for i := 0; i < len(batch); i++ {
+    select {
+    case c := <-confirms:
+        if !c.Ack { /* 处理 nack */ }
+    case <-time.After(5 * time.Second):
+        // 超时重发
     }
-    operations.waitForConfirmsOrDie(5000);
-    return null;
-});
+}
 ```
 
 **注意**：批量发送会增加延迟，适合时序敏感度低的批处理场景。
@@ -871,12 +1144,21 @@ A: 检查顺序：
 
 **核心做法**：
 
-```java
-// 方案：业务唯一 ID + 去重表
-// 1. 消息体中携带全局唯一 ID（如 orderId + eventType + timestamp）
-// 2. 消费时 INSERT INTO msg_dedup(id) VALUES(?)
-// 3. 主键冲突则视为重复，跳过处理
-// 4. 定期清理过期记录
+```go
+// 方案：业务唯一 ID + 去重表（伪代码）
+// 1. 消息体携带全局唯一 ID（如 orderId + eventType + timestamp）
+// 2. 消费时 INSERT INTO msg_dedup(msg_id) ON CONFLICT DO NOTHING
+// 3. 受影响行数为 0 则视为重复，跳过处理
+// 4. 去重表与业务操作在同一事务中执行
+func handleMessage(msgID string, body []byte) error {
+    return db.Transaction(func(tx *gorm.DB) error {
+        result := tx.Exec("INSERT INTO msg_dedup(msg_id) VALUES(?) ON DUPLICATE KEY UPDATE msg_id=msg_id", msgID)
+        if result.RowsAffected == 0 {
+            return nil // 重复消息，跳过
+        }
+        return processBusiness(tx, body)
+    })
+}
 ```
 
 **面试题**：
@@ -909,19 +1191,22 @@ RabbitMQ 的 Queue 内消息是有序的（FIFO），但多消费者、Confirm �
 
 **实战方案**（推荐）：
 
-```java
-// 订单场景：同一个 orderId 的消息路由到同一个 Queue
-// 使用一致性 Hash Exchange (rabbitmq_consistent_hash_exchange)
-@Bean
-public Exchange consistentHashExchange() {
-    return new CustomExchange("order.hash.exchange", "x-consistent-hash", true, false);
-}
+```go
+// 声明一致性 Hash Exchange（需启用 rabbitmq_consistent_hash_exchange 插件）
+ch.ExchangeDeclare("order.hash.exchange", "x-consistent-hash", true, false, false, false, nil)
 
-// 或单 Queue + 单 Consumer + 信号量限流
-@RabbitListener(queues = "order.sequence.queue", concurrency = "1")
-public void handleOrder(Message msg) {
-    // 单线程处理，天然有序
-}
+// 发布时以 orderId 作为 routing key，插件按 hash 路由到对应 Queue
+ch.Publish("order.hash.exchange", orderId, false, false, amqp.Publishing{Body: body})
+
+// 单 Queue + 单 Consumer 保证顺序（并发=1）
+msgs, _ := ch.Consume("order.sequence.queue", "", false, false, false, false, nil)
+// 只启动一个消费 goroutine，天然有序
+go func() {
+    for msg := range msgs {
+        handleOrder(msg.Body)
+        msg.Ack(false)
+    }
+}()
 ```
 
 **面试题**：
