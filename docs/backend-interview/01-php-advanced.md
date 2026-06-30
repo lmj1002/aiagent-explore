@@ -14,6 +14,7 @@
 5. [性能调优](#5-性能调优)
 6. [安全防护](#6-安全防护)
 7. [架构设计](#7-架构设计)
+8. [Swoole 协程引擎与 Hyperf 框架（已拆分）](#8-swoole-协程引擎与-hyperf-框架)
 
 ---
 
@@ -255,205 +256,27 @@ opcache.jit_buffer_size=256M
 
 ## 3. 框架核心
 
-### 3.1 Laravel vs Hyperf 生命周期对比
+PHP 框架核心知识（生命周期、服务容器、依赖注入、服务注册、门面、中间件、路由、AOP、协程运行时）已拆分为三份独立文档，便于按框架专项查阅：
 
-```
-Laravel 请求生命周期
-┌──────────┐    ┌───────────┐    ┌──────────┐    ┌────────────┐
-│ public/   │───►│ Kernel    │───►│ Service  │───►│ Router     │
-│ index.php │    │ handle()  │    │ Providers│    │ dispatch() │
-└──────────┘    └───────────┘    └──────────┘    └────────────┘
-                     │                                 │
-                     │  ┌─────────────┐                 │
-                     │  │ Middleware  │◄────────────────│
-                     │  │ (全局/路由) │                 │
-                     │  └─────────────┘                 │
-                     ▼                                 ▼
-                ┌────────────┐                  ┌──────────────┐
-                │ Controller │                  │ Terminate    │
-                │ → Service  │                  │ Middleware   │
-                │ → Model    │                  │ Kernel       │
-                └────────────┘                  │ terminate() │
-                                                └──────────────┘
-
-Hyperf 请求生命周期（Swoole 常驻内存）
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│ Server       │───►│ OnRequest    │───►│ Request      │───►│ Middleware   │
-│ Start        │    │ (协程回调)    │    │ (PSR-7)      │    │ Pipeline     │
-└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
-       │                                                          │
-       │  ┌──────────────────┐                                    │
-       │  │ 依赖注入容器       │◄─────────────────────────────────│
-       │  │ (在 OnStart 中    │                                    │
-       │  │  完成初始化)      │                                    │
-       │  └──────────────────┘                                    │
-       ▼                                                          ▼
-┌────────────────┐                                    ┌──────────────────┐
-│ Router         │                                    │ Controller       │
-│ (路由分发)      │────► 处理链 ────► 返回响应 ────►│ → Service        │
-└────────────────┘                                    │ → Model/Repository│
-                                                     └──────────────────┘
-```
-
-**核心区别：**
-
-| 维度 | Laravel | Hyperf |
-|------|---------|--------|
-| 运行模式 | PHP-FPM（请求销毁） | Swoole 常驻内存 |
-| 容器 | 每次请求重建 | 全局单例，请求间复用 |
-| 协程 | 无原生支持 | 自动协程化，所有 I/O 异步 |
-| 连接池 | DB 连接按需创建 | DB/Redis 连接池管理 |
-| 热重载 | 无需 | 需 Watch 组件或 reload |
-
-**面试 Q：常驻内存模式有哪些坑？如何解决？**
-
-常见问题矩阵：
-
-| 问题 | 原因 | 解决方案 |
-|------|------|---------|
-| 静态变量污染 | 全局静态变量被并发访问 | 避免使用静态变量，改用协程安全的 Context |
-| 全局引用泄露 | 闭包捕获引用导致内存持续增长 | 使用 `defer()` 释放资源，定期 gc_collect_cycles |
-| 连接池耗尽 | MySQL gone away 未处理 | 设置保活探测，自动重连策略 |
-| 协程上下文混乱 | 数据混入不同请求 | 使用 Coroutine::id() 隔离上下文 |
-| 热更新代码不生效 | 内存中的代码未刷新 | Swoole reload + 灰度放量 |
-
-### 3.2 容器 / IoC 模式
-
-**依赖注入容器核心概念比较：**
-
-```
-传统硬编码：
-    $logger = new FileLogger('/var/log/app.log');
-    $userController = new UserController($logger);
-
-DI 容器自动解析：
-    ┌──────────────┐
-    │   Container   │  Binds abstractions to concretions
-    │               │
-    │   $container  │  ──► resolve(UserController::class)
-    │   — aliases   │        │
-    │   — instances │        ├── constructor: LoggerInterface $logger
-    │   — singletons│        │       └── resolve(LoggerInterface::class)
-    │   — bindings  │        │              └── new FileLogger(...)
-    │   — tag       │        └── recursive resolve all dependencies
-    └──────────────┘
-```
-
-**Laravel 容器核心方法：**
-
-```php
-// 1. 绑定接口到实现
-$this->app->bind(PaymentGateway::class, StripeGateway::class);
-
-// 2. 单例
-$this->app->singleton(LoggerInterface::class, function () {
-    return new Monolog\Logger('app');
-});
-
-// 3. 上下文绑定（不同场景注入不同实现）
-$this->app->when(OrderController::class)
-          ->needs(PaymentGateway::class)
-          ->give(AlipayGateway::class);
-
-// 4. Tag 批量解析
-$this->app->tag([ReportGenerate::class, DataExport::class], 'console_commands');
-$this->app->tagged('console_commands')->each->handle();
-
-// 5. 服务提供者注册顺序
-// 1) Register 阶段: 绑定接口
-// 2) Boot 阶段: 使用已注册的服务（需注意循环依赖）
-```
-
-**Hyperf 容器特性：**
-
-```php
-// 自动注入（通过反射）
-#[Inject]
-private LoggerInterface $logger;
-
-// AOP 自动代理
-#[Aspect]
-class LoggingAspect implements AspectInterface
-{
-    public $classes = [
-        UserService::class . '::createUser',
-    ];
-
-    public function process(ProceedingJoinPoint $point)
-    {
-        $this->logger->info('before');
-        $result = $point->process();
-        $this->logger->info('after');
-        return $result;
-    }
-}
-```
-
-**面试高频题：**
-
-**Q: IoC 容器中的循环依赖如何解决？**
-
-| 场景 | 解决方案 |
+| 文档 | 覆盖内容 |
 |------|---------|
-| 构造器注入循环 | 使用 Setter 注入 / 属性注入 / 接口拆分（引入中间接口） |
-| 单例 + 多例交叉引用 | 使用代理模式延迟初始化 |
-| Laravel 特有 | 使用 `$app->afterResolving()` 后置回调 |
-| Hyperf 特有 | 使用懒加载代理 `#[Inject(lazy: true)]` |
+| [Laravel 框架高级面试知识架构](./14-laravel-advanced.md) | 请求生命周期、服务容器（IoC）、依赖注入、服务提供者与服务注册、门面（Facade）、中间件、路由、Eloquent ORM |
+| [Hyperf 框架高级面试知识架构](./15-hyperf-advanced.md) | Hyperf 核心架构、生命周期（启动期/请求期/销毁期）、编译期 DI、AOP 切面织入、协程组件与服务治理 |
+| [Swoole 协程通信引擎高级面试知识架构](./16-swoole-advanced.md) | 进程模型、协程原理与调度、上下文隔离、Channel/WaitGroup 通信原语、连接池、生产实践 |
 
-### 3.3 中间件与路由
+### 3.1 运行模式速览
 
-**中间件执行顺序（Laravel）：**
+PHP 主流框架按运行模型分两类：以 Laravel 为代表的 **PHP-FPM 请求即销毁** 模型，和以 Hyperf 为代表的 **Swoole 常驻内存 + 协程** 模型。前者每请求重建容器、天然隔离、心智负担低；后者框架只引导一次、请求间复用对象图、靠协程上下文隔离，性能高但需警惕状态污染。
 
-```
- Request
-    │
-    ▼
-┌─────────────┐
-│ Middleware 1 │ (全局 - 前)
-│  - TrimStrings
-│  - TrustProxies
-│  - HandleCors
-├─────────────┤
-│ Middleware 2 │ (中间件组 - web/api)
-│  - EncryptCookies
-│  - StartSession
-│  - ShareErrorsFromSession
-├─────────────┤
-│ Middleware 3 │ (路由中间件)
-│  - auth:api
-│  - throttle:60,1
-├─────────────┤
-│ Controller   │
-├─────────────┤
-│ Middleware 3 │ (路由中间件 - 后)
-├─────────────┤
-│ Middleware 2 │ (中间件组 - 后)
-├─────────────┤
-│ Middleware 1 │ (全局 - 后)
-└─────────────┘
-    │
-    ▼
-  Response
-```
+| 维度 | Laravel (FPM) | Hyperf (Swoole 协程) |
+|------|---------------|---------------------|
+| 运行模式 | 请求销毁 | 常驻内存 |
+| 容器 | 每次请求重建 | 进程级单例，请求间复用 |
+| 协程 | 无原生支持 | 自动协程化，I/O 异步 |
+| 连接池 | DB 连接按需创建 | DB/Redis 连接池管理 |
+| 请求隔离 | 进程天然隔离 | 协程 + Context 隔离 |
 
-**路由性能优化：**
-
-```php
-// 不推荐 — 每次请求加载所有路由
-Route::resource('users', UserController::class);
-
-// 推荐 — 针对高频路由使用闭包缓存
-Route::get('api/users/search', [UserController::class, 'search'])
-    ->middleware(['throttle:100,1']);
-
-// 在生产中使用 路由缓存 和 路由文件拆分
-// php artisan route:cache
-// 将路由文件拆分为 web.php / api.php / admin.php 按组加载
-
-// Hyperf 路由注解
-#[GetMapping(path: '/users/{id}')]
-public function show(int $id) {}
-```
+> 生命周期细节、容器/DI/门面/服务注册的完整实现见 [Laravel 文档](./14-laravel-advanced.md)；Hyperf 生命周期、AOP、协程安全见 [Hyperf 文档](./15-hyperf-advanced.md)；Swoole 进程模型与协程调度见 [Swoole 文档](./16-swoole-advanced.md)。
 
 ---
 
@@ -1290,6 +1113,20 @@ class Tracer
 
 ---
 
+## 8. Swoole 协程引擎与 Hyperf 框架
+
+PHP 的高性能常驻内存方向（Swoole 协程引擎、基于它的 Hyperf 框架）内容较多，已拆分为独立文档，便于专题查阅：
+
+| 主题 | 文档 | 覆盖要点 |
+|------|------|---------|
+| **Swoole 协程通信引擎** | [16-swoole-advanced.md](./16-swoole-advanced.md) | 进程模型（Master/Reactor/Manager/Worker/Task）、协程原理与调度、协程编程陷阱与上下文隔离、Channel/WaitGroup/Process 通信原语、连接池、生产实践 |
+| **Hyperf 框架** | [15-hyperf-advanced.md](./15-hyperf-advanced.md) | 框架架构、生命周期（启动期/请求期/销毁期与事件回调）、依赖注入（编译期代理类）、AOP 切面织入原理、协程安全、服务治理、生产实践 |
+| **Laravel 框架** | [14-laravel-advanced.md](./14-laravel-advanced.md) | 请求生命周期、服务容器、依赖注入、服务提供者与服务注册、门面（Facade）、中间件、路由、Eloquent ORM |
+
+> 为什么单独拆出来：Swoole/Hyperf 属于「常驻内存 + 协程」范式，与本文档前述的 PHP-FPM 短生命周期模型差异很大，独立成篇更利于体系化掌握。本节第 1.3 的协程对比、第 2.1 的运行模式对比仍保留在本文档，作为入口索引。
+
+---
+
 ## 附录
 
 ### A. 推荐阅读清单
@@ -1332,5 +1169,5 @@ class Tracer
 
 > **维护说明：**
 > - 本文档随 PHP 版本迭代和生态变化持续更新
-> - 最新更新：2025-06 | PHP 版本覆盖 8.0 ~ 8.4
+> - 最新更新：2026-06 | PHP 版本覆盖 8.0 ~ 8.4；框架核心（Laravel / Hyperf / Swoole）已拆分为 [14](./14-laravel-advanced.md) / [15](./15-hyperf-advanced.md) / [16](./16-swoole-advanced.md) 三份独立文档
 > - 作者：Senior PHP Engineer / Architect

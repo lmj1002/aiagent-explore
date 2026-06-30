@@ -1,7 +1,7 @@
 # 后端高级面试知识架构 — 总索引
 
 > **团队知识库入口文档**  
-> 汇聚 13 个技术领域的深度面试知识体系，覆盖语言基础、数据存储、中间件、容器编排、架构设计等方向。  
+> 汇聚 16 份深度面试知识文档，覆盖语言基础、Web 框架、数据存储、中间件、容器编排、架构设计等方向。  
 > 每份文档面向 5-8 年经验的高级后端开发 / 架构师，兼顾面试备战与生产实践参考。
 
 ---
@@ -63,8 +63,11 @@ NN-{tech}-advanced.md
 
 | # | 文档 | 难度 | 简介 |
 |---|------|------|------|
-| 01 | [PHP 高级面试知识架构](./01-php-advanced.md) | ⭐⭐⭐⭐ | 覆盖 PHP 基础语法（类型系统、命名空间、Traits、闭包、生成器）、运行原理（Zend 引擎执行流程、OPcache、内存管理）、主流框架核心（Laravel 服务容器、生命周期、Eloquent ORM 原理）、设计模式、性能调优（Xdebug 分析、慢查询、Opcache）、安全防护（SQL 注入、XSS、CSRF、SSRF）、架构设计（分层架构、领域驱动、CQRS、事件溯源）。适合 PHP 主栈开发者深度备战。 |
+| 01 | [PHP 高级面试知识架构](./01-php-advanced.md) | ⭐⭐⭐⭐ | 覆盖 PHP 基础语法（类型系统、命名空间、Traits、闭包、生成器）、运行原理（Zend 引擎执行流程、OPcache、内存管理）、主流框架核心（Laravel 服务容器、生命周期、Eloquent ORM 原理）、设计模式、性能调优（Xdebug 分析、慢查询、Opcache）、安全防护（SQL 注入、XSS、CSRF、SSRF）、架构设计（分层架构、领域驱动、CQRS、事件溯源）。适合 PHP 主栈开发者深度备战。框架核心与协程方向已拆分到 14/15/16 三份专项文档。 |
 | 02 | [Go 高级面试知识架构](./02-golang-advanced.md) | ⭐⭐⭐⭐⭐ | 覆盖 Go 语言核心（Goroutine 与 Channel、内存模型、反射原理）、并发编程（GMP 调度模型、sync 包源码、并发模式）、运行时原理（GC 演进、逃逸分析、栈扩张）、标准库深度（net/http、database/sql、context）、框架与微服务（Gin / Kitex / 自研框架对比）、数据库与缓存（GORM 原理、连接池、缓存模式）、性能调优（pprof 使用、火焰图、benchmark 编写）、消息队列集成、Go vs PHP 高阶对比。适合 PHP 转 Go 或 Go 主栈的架构师。 |
+| 14 | [Laravel 框架高级面试知识架构](./14-laravel-advanced.md) | ⭐⭐⭐⭐ | 聚焦 Laravel 框架核心机制：请求生命周期（index.php → Kernel → ServiceProvider → 路由 → 中间件 → 响应 → terminate）、服务容器（IoC 绑定/单例/上下文绑定/标签/自动解析与循环依赖）、依赖注入（构造器/方法注入、接口绑定）、服务提供者与服务注册（register/boot 阶段、deferred provider）、门面（Facade 原理与 `__callStatic`、实时门面）、中间件、路由（缓存与优化）、Eloquent ORM 与 N+1。从 01-PHP 文档框架核心章节拆分扩充。 |
+| 15 | [Hyperf 框架高级面试知识架构](./15-hyperf-advanced.md) | ⭐⭐⭐⭐⭐ | 基于 Swoole 协程的高性能 PHP 框架：核心架构（注解驱动 + DI + AOP + 协程组件）、生命周期（框架启动期/请求处理期/销毁期与 onWorkerStart/onRequest 等事件回调）、编译期依赖注入（扫描注解生成代理类、零反射、进程级单例）、AOP 切面织入原理（代理类生成、切点匹配、多切面 priority 洋葱执行、final/private/自调用失效）、协程安全（Context 隔离、连接池借还）、服务治理与生产实践。与 Laravel 容器对比。 |
+| 16 | [Swoole 协程通信引擎高级面试知识架构](./16-swoole-advanced.md) | ⭐⭐⭐⭐ | 常驻内存网络通信引擎核心：进程模型（Master/Reactor/Manager/Worker/Task Worker 职责）、协程原理与调度（用户态协作式调度、epoll 事件循环、一键 Hook 协程化）、协程编程陷阱与上下文隔离（全局/静态变量串号、Context、连接池模型）、CSP 通信原语（Channel/WaitGroup/Atomic/Table/Process）、进程间 vs 协程间共享、生产实践（max_request、reload、heartbeat）。配合 15-Hyperf 文档阅读。 |
 
 ### 数据库
 
@@ -80,7 +83,7 @@ NN-{tech}-advanced.md
 |---|------|------|------|
 | 04 | [Redis 高级面试知识架构](./04-redis-advanced.md) | ⭐⭐⭐⭐⭐ | 覆盖 Redis 数据结构底层编码演进（从 ziplist 到 listpack、quicklist、skiplist）、核心原理（IO 多路复用、Reactor 模型、单线程 vs 多线程、持久化 RDB/AOF 深度对比、过期策略与内存淘汰）、高可用架构（主从复制原理、Sentinel 故障转移、Cluster 分片与请求路由、数据倾斜处理）、缓存设计（穿透/击穿/雪崩解决方案、更新一致性策略）、分布式场景（分布式锁 Redlock 争议、分布式限流滑窗、Lua 脚本原子性）、性能调优（内存优化、pipeline、bigkey 治理）、大厂综合案例。 |
 | 05 | [RabbitMQ 高级面试知识架构](./05-rabbitmq-advanced.md) | ⭐⭐⭐⭐ | 讲解 RabbitMQ 核心概念（Exchange 四种类型详解、Binding 路由规则）、消息可靠性（生产者确认 Confirm、持久化策略、消费者 Ack 机制及重试、死信队列与死信交换机）、高级特性（延迟队列实现方式、优先级队列、TTL）、集群与高可用（普通集群与镜像队列、Quorum Queue、Federation 与 Shovel）、性能调优（预取计数、连接与通道管理、流控机制）、生产实践（消息幂等性、顺序消息保证、大规模集群运维）、与 Kafka 全面对比。 |
-| 06 | [Kafka 高级面试知识架构](./06-kafka-advanced.md) | ⭐⭐⭐⭐⭐ | 深度剖析 Apache Kafka 消息模型与架构演进、存储原理（分区与日志分段、索引文件结构、零拷贝技术）、生产者原理（分区策略、ACK 参数调优、幂等与事务）、消费者原理（Rebalance 机制、位移提交策略、静态消费组）、副本机制（ISR 设计、Leader/Follower 数据一致性、Unclean Leader 选举）、控制器与协调器（Controller 选举与变更、Group Coordinator 协议）、KRaft 模式（去 ZooKeeper 架构、Quorum 共识算法）、性能调优与生产运维、与 RabbitMQ 场景对比。 |
+| 06 | [Kafka 高级面试知识架构](./06-kafka-advanced.md) | ⭐⭐⭐⭐⭐ | 按「入门 → 集群搭建 → 客户端开发」的课程化路径组织：产品介绍与核心概念、快速上手与命令行、ZooKeeper/KRaft 集群搭建、基础客户端开发流程、消费者分组消费机制（Rebalance / Coordinator / 位移提交 / 重复丢失对策）、生产者拦截器、消息序列化与 Schema Registry、分区路由与有序性、消息缓存（RecordAccumulator）、发送应答机制（acks / ISR / HW / LEO / Leader Epoch / Unclean 选举）、幂等性、压缩与事务（Exactly-Once）。附录涵盖服务端原理与运维（存储/Controller/KRaft/调优/MQ 选型/Streams）、20 道分级面试题库、参数速查表。 |
 
 ### 容器与编排
 
@@ -208,10 +211,18 @@ Phase 4 ─── 架构与综合（第 7-8 周）
 | 11-WebSocket 高级面试知识架构 | v1.0 | 2026-06 | 初版完成 |
 | 12-微服务架构高级面试知识架构 | v1.0 | 2026-06 | 初版完成 |
 | 13-系统设计高级面试知识架构 | v1.0 | 2026-06 | 初版完成 |
+| 14-Laravel 框架高级面试知识架构 | v1.0 | 2026-06 | 从 01-PHP 框架核心拆分扩充 |
+| 15-Hyperf 框架高级面试知识架构 | v1.0 | 2026-06 | 从 01-PHP 协程模块拆分扩充 |
+| 16-Swoole 协程通信引擎高级面试知识架构 | v1.0 | 2026-06 | 从 01-PHP 协程模块拆分扩充 |
 
 ### 更新日志
 
 ```
+2026-06-30 | v1.1.0
+  - 新增 14-Laravel / 15-Hyperf / 16-Swoole 三份 PHP 框架专项文档
+  - 01-PHP 文档「框架核心」「Swoole 协程引擎与 Hyperf」章节拆分为独立文档，仅保留入口索引
+  - 同步更新语言栈分组索引与版本说明
+
 2026-06-15 | v1.0.0
   - 初始版本发布，覆盖 13 个技术领域
   - 首个总索引 README 创建
