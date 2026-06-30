@@ -2,416 +2,454 @@
 
 > 目标读者：高级后端开发 / 系统架构师
 > 本文从源码、原理、生产实践三个维度深度剖析 Apache Kafka，涵盖高频面试题与最佳实践。
+>
 
 ---
 
 ## 目录
 
-1. [基础概念](#1-基础概念)
-2. [存储原理](#2-存储原理)
-3. [生产者原理](#3-生产者原理)
-4. [消费者原理](#4-消费者原理)
-5. [副本机制](#5-副本机制)
-6. [控制器与协调器](#6-控制器与协调器)
-7. [KRaft 模式](#7-kraft-模式)
-8. [性能调优](#8-性能调优)
-9. [生产运维](#9-生产运维)
-10. [与 RabbitMQ 场景对比](#10-与-rabbitmq-场景对比)
+**篇一 · Kafka 入门与集群搭建**
+
+1. [Kafka 产品介绍](#1-kafka-产品介绍)
+2. [快速上手 Kafka](#2-快速上手-kafka)
+3. [搭建 ZooKeeper 集群](#3-搭建-zookeeper-集群)
+4. [搭建并使用 Kafka 集群](#4-搭建并使用-kafka-集群)
+
+**篇二 · 客户端开发详解**（对应视频 kfk2）
+
+5. [基础客户端开发流程](#5-基础客户端开发流程)
+6. [消费者分组消费机制详解](#6-消费者分组消费机制详解)
+7. [生产者拦截器机制详解](#7-生产者拦截器机制详解)
+8. [消息序列化机制](#8-消息序列化机制)
+9. [消息分区路由机制](#9-消息分区路由机制)
+10. [生产者消息缓存机制](#10-生产者消息缓存机制)
+11. [生产者发送应答机制](#11-生产者发送应答机制)
+12. [生产者消息幂等性](#12-生产者消息幂等性)
+13. [消息压缩机制与消息事务](#13-消息压缩机制与消息事务)
+
+**附录**
+
+- [附录 A · 服务端原理与生产运维（待对齐视频后续目录）](#附录-a服务端原理与生产运维待对齐视频后续目录)
+- [附录 B · 高频面试题库（分级）](#附录-b高频面试题库分级)
+- [附录 C · 参数速查表](#附录-c参数速查表)
+- [附录 D · 参考资源](#附录-d参考资源)
 
 ---
 
-## 1. 基础概念
+# 篇一 · Kafka 入门与集群搭建
 
-### 1.1 消息模型
+## 1. Kafka 产品介绍
 
-Kafka 采用 **发布-订阅（Pub-Sub）** 消息模型，以 Topic 为逻辑单位组织消息。
+### 1.1 Kafka 是什么
 
-**核心抽象：**
+Apache Kafka 是一个**分布式流处理平台**（Distributed Streaming Platform），最初由 LinkedIn 开发用于解决日志聚合问题，2011 年开源。它的三大核心能力：
+
+1. **消息系统（Messaging）**：发布-订阅模型，替代传统 MQ
+2. **存储系统（Storage）**：消息持久化到磁盘，支持长期保留与回溯消费
+3. **流处理（Stream Processing）**：通过 Kafka Streams / ksqlDB 做实时计算
+
+> Kafka 不只是「消息队列」。它的定位是**流式存储平台** —— 消息默认长期保留、支持任意回溯消费，这是与 RabbitMQ 这类「投递完即删除」的消息代理最本质的区别。
+
+### 1.2 核心概念
+
+Kafka 采用**发布-订阅（Pub-Sub）** 消息模型，以 Topic 为逻辑单位组织消息：
 
 ```
 Producer → Topic[Partition0, Partition1, Partition2] → Consumer Group
 ```
 
-- **Producer**：发布消息到指定 Topic
-- **Consumer**：从 Topic 订阅消息，以 Consumer Group 为单位消费
-- **Broker**：Kafka 服务器节点，存储消息数据
-- **Topic**：消息的逻辑分类
-- **Partition**：Topic 的分片，是消息存储的最小有序单元
-- **Consumer Group**：多个 Consumer 组成一个逻辑消费组，组内各 Consumer 消费不同 Partition
+| 术语 | 定义 |
+|------|------|
+| **Message（消息）** | Kafka 中数据的基本单元，由 Key、Value、Header、Timestamp、Offset 组成 |
+| **Topic（主题）** | 消息的逻辑分类容器，生产者向 Topic 投递，消费者从 Topic 拉取 |
+| **Partition（分区）** | 物理存储单元，每个 Topic 含多个 Partition，分布在不同 Broker 上；**单 Partition 内消息严格有序** |
+| **Broker（代理节点）** | Kafka 服务器节点，多个 Broker 组成集群，存储并管理本地 Partition 副本 |
+| **Producer（生产者）** | 发布消息到指定 Topic |
+| **Consumer（消费者）** | 从 Topic 订阅消息，以 Consumer Group 为单位消费 |
+| **Consumer Group（消费者组）** | 同组内消费者共同消费 Topic 全量 Partition；**一个 Partition 只能被组内一个消费者消费** |
+| **Offset（偏移量）** | 消息在 Partition 内的唯一编号，单调递增 |
+| **Controller（控制器）** | 集群的"大脑"，负责分区 Leader 选举、元数据管理、Broker 上下线处理 |
 
-### 1.2 Topic / Partition / Broker / Consumer Group
+**【面试】Kafka 为什么使用 Partition？Partition 数量如何确定？**
 
-**面试高频题：**
+Partition 是 Kafka 实现水平扩展和并行消费的核心机制：
 
-> Q: Kafka 为什么使用 Partition？Partition 数量如何确定？
-
-A: Partition 是 Kafka 实现水平扩展和并行消费的核心机制。
 - **并行度**：一个 Partition 只能被一个 Consumer 消费，Partition 数决定了 Consumer Group 内最大并行度
 - **存储扩展**：Partition 分布在多个 Broker 上，突破单机磁盘容量限制
 - **有序性保证**：单个 Partition 内消息有序，跨 Partition 无序
 
 Partition 数量确定原则：
 - 下限：`max(预期峰值吞吐量 / 单 Partition 吞吐量, 预期消费者数量)`
-- 上限：不超过 Broker 总磁盘数 * 磁盘 I/O 能力的合理倍数（建议单 Broker 不超过 2000 个 Partition）
-- 经验公式：`Partition数 = (目标吞吐量 MB/s) / (单 Partition 吞吐量 MB/s)`
-- 注意：Partition 越多，选举、重平衡、元数据管理的开销越大
+- 经验公式：`Partition数 = 目标吞吐量(MB/s) / 单 Partition 吞吐量(MB/s)`，单 Partition 写入能力约 10 MB/s
+- 上限：建议单 Broker 不超过 2000 个 Partition；每 Broker 承载 100~200 个分区为宜
+- 分区数尽量取 Broker 数量的整数倍（保证均匀分布）
+- 注意：Partition 越多，选举、重平衡、元数据管理、文件句柄开销越大
+
+### 1.3 架构演进里程碑
+
+| 版本 | 关键特性 |
+|------|---------|
+| **0.8.x** | 引入副本机制、Consumer Group |
+| **0.10.0** | Kafka Streams 发布 |
+| **0.11.0** | 幂等 Producer、事务消息、Leader Epoch |
+| **2.8.0** | KRaft 模式（去 ZooKeeper）预览 |
+| **3.3.0** | KRaft 生产可用 |
+| **4.0** | 彻底移除 ZooKeeper，仅保留 KRaft |
+
+### 1.4 应用场景
+
+| 场景 | 说明 |
+|------|------|
+| 日志聚合 | 收集分散的服务日志，统一写入下游（ES / HDFS / 数据湖） |
+| 指标监控 | 应用埋点、Metrics 上报的传输通道 |
+| 消息系统 | 服务解耦、异步削峰 |
+| 流处理 | 实时聚合、Join、窗口计算（Flink / Kafka Streams） |
+| 事件溯源 | Event Sourcing + CQRS，依赖长期保留与回溯能力 |
+| 数据管道 | MySQL CDC → 数据仓库 / 搜索引擎 |
 
 ---
 
-**源码级原理：**
+## 2. 快速上手 Kafka
 
-`kafka.log.Log` 是 Partition 的日志表示，每个 Partition 对应一个目录（`<topic>-<partitionId>`），内部包含多个 LogSegment：
+### 2.1 单机部署（以 KRaft 模式为例，Kafka 3.x+）
 
-```go
-// 等价概念（Go 伪代码，对应 Kafka Scala 源码 kafka.log.Log）
-type PartitionLog struct {
-    Dir                  string            // 日志目录: /data/kafka/topics/my-topic-0/
-    Config               LogConfig
-    RecoveryPoint        int64
-    Segments             map[int64]*LogSegment // baseOffset → Segment
-    ProducerStateManager *ProducerStateManager // 幂等/事务状态管理
-}
+```bash
+# 1. 下载并解压
+wget https://downloads.apache.org/kafka/3.7.0/kafka_2.13-3.7.0.tgz
+tar -xzf kafka_2.13-3.7.0.tgz && cd kafka_2.13-3.7.0
+
+# 2. 生成集群 UUID
+KAFKA_CLUSTER_ID="$(bin/kafka-storage.sh random-uuid)"
+
+# 3. 格式化存储目录
+bin/kafka-storage.sh format -t $KAFKA_CLUSTER_ID -c config/kraft/server.properties
+
+# 4. 启动 Broker
+bin/kafka-server-start.sh config/kraft/server.properties
 ```
 
-### 1.3 投递语义（Delivery Semantics）
+> Kafka 2.x 及更早版本需先启动 ZooKeeper（`bin/zookeeper-server-start.sh`），再启动 Broker。详见第 3、4 节。
 
-| 语义 | 生产者设置 | 消费者设置 | 消息可能 |
-|------|-----------|-----------|---------|
-| At Most Once | `acks=0` | 不等偏移量提交 | 丢失 |
-| At Least Once | `acks=all` | 提交偏移量后处理 | 重复 |
-| Exactly Once | `acks=all` + `enable.idempotence=true` | 事务或幂等消费 | 恰好一次 |
+### 2.2 命令行工具基础操作
 
-**面试高频题：**
+```bash
+# 创建 Topic（3 分区、1 副本）
+bin/kafka-topics.sh --create --topic quickstart \
+  --partitions 3 --replication-factor 1 \
+  --bootstrap-server localhost:9092
 
-> Q: Exactly Once 在 Kafka 中如何实现？
+# 查看 Topic 详情
+bin/kafka-topics.sh --describe --topic quickstart \
+  --bootstrap-server localhost:9092
 
-A: Exactly Once 是生产者幂等性 + 事务 API 的组合实现：
+# 列出所有 Topic
+bin/kafka-topics.sh --list --bootstrap-server localhost:9092
 
-1. **生产者幂等性**（`enable.idempotence=true`）：
-   - 每个 Producer 分配唯一的 `producerId`（PID）
-   - 每条消息附带单调递增的 `sequence number`
-   - Broker 端按 `<PID, Partition, SeqNo>` 去重
-   - 网络重试导致的重复消息被 Broker 自动过滤
+# 生产消息（控制台生产者）
+bin/kafka-console-producer.sh --topic quickstart \
+  --bootstrap-server localhost:9092
 
-2. **事务（`transactional.id`）**：
-   - 跨 Partition/跨 Topic 的原子写入
-   - 使用 `__transaction_state` 内部 Topic 记录事务状态
-   - 两阶段提交：`prePareCommit` → `commit`
-   - 消费者需设置 `isolation.level=read_committed` 才能读到已提交事务消息
+# 消费消息（从头开始）
+bin/kafka-console-consumer.sh --topic quickstart \
+  --from-beginning --bootstrap-server localhost:9092
 
-**生产最佳实践：**
+# 查看消费者组的 Lag
+bin/kafka-consumer-groups.sh --describe --group my-group \
+  --bootstrap-server localhost:9092
+```
 
-- 大多数场景使用 **At Least Once** + 下游幂等去重即可
-- Exactly Once 会引入约 20% 的性能开销，仅在金融级场景使用
-- 事务消息的 Producer Session 超时（`transaction.timeout.ms`）默认 60000ms，大事务需要调大
+### 2.3 第一条消息的完整链路
+
+```
+Producer.send()
+  → 序列化 Key/Value
+  → 分区器选择 Partition
+  → 写入 RecordAccumulator 缓存
+  → Sender 线程批量发送到 Broker Leader
+  → Leader 写入本地 Log（PageCache）
+  → ISR 副本同步
+  → 返回 ack
+  → Consumer poll() 拉取
+  → 反序列化 → 业务处理 → 提交 offset
+```
+
+> 这条链路贯穿篇二的全部章节：序列化（第 8 节）、分区路由（第 9 节）、消息缓存（第 10 节）、发送应答（第 11 节）、消费（第 6 节）。
 
 ---
 
-## 2. 存储原理
+## 3. 搭建 ZooKeeper 集群
 
-### 2.1 日志存储（Log Segment）
+> 适用于 Kafka 3.x 之前（或仍使用 ZK 模式的集群）。Kafka 4.0 已移除 ZK，新集群建议直接用 KRaft（见第 4 节与附录 A）。
 
-**物理结构：**
+### 3.1 ZooKeeper 在 Kafka 中的职责
 
-```
-/topics/__consumer_offsets-0/
-├── 00000000000000000000.log       # 消息数据
-├── 00000000000000000000.index     # 偏移量索引（稀疏）
-├── 00000000000000000000.timeindex # 时间戳索引
-└── 00000000000000000059.snapshot  # 生产者状态快照
-```
+| 职责 | 说明 |
+|------|------|
+| Broker 注册 | 每个 Broker 启动时在 `/brokers/ids` 注册临时节点 |
+| Controller 选举 | 抢占式创建 `/controller` 临时节点，成功者为 Controller |
+| Topic 元数据 | 存储 Topic / Partition / 副本分配信息 |
+| ISR 变更 | 记录每个 Partition 的 ISR 集合 |
+| 配额与 ACL | 存储动态配置、客户端配额、权限信息 |
 
-- LogSegment 是 Kafka 存储的最小物理单元，默认 1GB 或 `log.segment.bytes` 配置
-- 活跃 Segment（active segment）可写，历史 Segment 只读
-- 每个 Segment 的命名以该 Segment 第一条消息的偏移量为基准（20 位补零）
+> 注意：偏移量（Offset）在 0.9+ 之后**不再存 ZooKeeper**，而是存入内部 Topic `__consumer_offsets`。
 
-**面试高频题：**
+### 3.2 集群规划与配置
 
-> Q: Kafka 为什么能够做到毫秒级消息写入？为什么即使磁盘读写也能这么快？
-
-A: 核心原因：
-
-1. **顺序 I/O**：Kafka 写入采用追加写，充分利用磁盘顺序读写性能（顺序写约 600 MB/s，随机写约 100 KB/s）
-2. **Page Cache 利用**：写入先落到 OS Page Cache，异步刷盘，避免直接磁盘 I/O
-3. **零拷贝**：消费者读取时通过 `sendfile` 系统调用，数据直接从 Page Cache 发送到网卡
-4. **批量处理**：Producer 批次发送，Broker 批次写入，Consumer 批次拉取
-
-### 2.2 索引文件（偏移量索引 & 时间戳索引）
-
-**偏移量索引（`.index`）：**
-
-- 稀疏索引，默认每写入 4KB 消息数据记录一条索引（`log.index.interval.bytes`）
-- 映射关系：`<相对偏移量, 物理位置>`
-- 定位过程：二分查找索引文件 → 拿到物理位置范围 → 顺序扫描 `.log` 文件
-
-```
-索引示例（稀疏结构）：
-相对偏移量  | 物理位置
-0          | 0
-100        | 4096
-200        | 8192
-```
-
-**时间戳索引（`.timeindex`）：**
-
-- 映射关系：`<时间戳, 相对偏移量>`
-- 用于按时间戳查找消息（如 `--offset --timestamp` 重设消费者偏移量）
-- 每条索引记录占用 12 字节（8 字节时间戳 + 4 字节偏移量）
-
-**面试高频题：**
-
-> Q: 如果索引文件不存在或被损坏，Kafka 怎么恢复？
-
-A: Kafka 通过**重建索引**机制恢复：扫描 `.log` 文件中消息的 `offset` 和 `timestamp` 字段，重新生成索引文件。这也是为什么 `.log` 文件已经包含完整数据，索引只是加速文件。
-
-### 2.3 日志清理与压缩（Log Cleanup & Compaction）
-
-两种策略，由 `log.cleanup.policy` 控制：
-
-| 策略 | 配置值 | 行为 |
-|------|-------|------|
-| 删除（DELETE） | `delete` | 根据保留时间或大小删除老 Segment |
-| 压缩（COMPACT） | `compact` | 保留每个 Key 的最新版本，丢弃旧版本 |
-
-**日志压缩原理：**
-
-```
-原始日志:
-offset 10: key=user1, value=A
-offset 11: key=user2, value=B
-offset 12: key=user1, value=C   ← 覆盖 offset 10
-offset 13: key=user3, value=D
-
-压缩后:
-offset 11: key=user2, value=B
-offset 12: key=user1, value=C
-offset 13: key=user3, value=D
-```
-
-- 使用 **Cleaner 线程**独立执行压缩
-- `min.cleanable.dirty.ratio` = 0.5（默认），脏数据占比超过 50% 触发压缩
-- 压缩后的 Log 仍然保持与原 Log 相同的偏移量（offset 不连续）
-
-**生产最佳实践：**
-
-- 日志压缩适用于**KV 语义**的数据，如用户配置、地址簿等
-- 普通日志使用 **DELETE** 策略
-- 不要对高吞吐的普通业务 Topic 启用 `compact`
-- `log.retention.bytes` 和 `log.retention.hours` 配合使用，优先满足较严格的条件
-
-### 2.4 零拷贝（Zero Copy / sendfile）
-
-**面试高频题：**
-
-> Q: Kafka 消费消息时如何实现零拷贝？相比传统方式节省了什么？
-
-A: 传统文件读取到网络发送的路径：
-
-```
-磁盘 → 内核缓冲区 → 用户缓冲区 → Socket 缓冲区 → 网卡
-（DMA读取）  （CPU拷贝）   （CPU拷贝）    （DMA写入）
-```
-
-共经历 **4 次上下文切换 + 4 次数据拷贝**。
-
-Kafka 使用 `sendfile`（`FileChannel.transferTo`）后的路径：
-
-```
-磁盘 → 内核缓冲区 → 网卡
-（DMA读取）        （DMA写入）
-```
-
-共经历 **2 次上下文切换 + 3 次数据拷贝（或 1 次，如果网卡支持 scatter-gather）**。
-
-**关键代码：**
-
-```go
-// 零拷贝核心：Linux sendfile 系统调用（Go net 包底层自动使用）
-// 等价于 Java NIO FileChannel.transferTo()
-// Go 中通过 os.File + net.Conn 组合，运行时自动选择 sendfile
-f, _ := os.Open(logSegmentPath)
-defer f.Close()
-// net.Conn.ReadFrom(f) 内部触发 sendfile，数据不经过用户态
-conn.(io.ReaderFrom).ReadFrom(f)
-
-// 路径：磁盘 →(DMA)→ 内核页缓存 →(sendfile)→ 网卡，跳过用户态拷贝
-```
-
-**生产最佳实践：**
-
-- Kafka Broker JVM 堆外内存（off-heap）数据不走零拷贝，因为需要通过 Java 堆
-- 零拷贝对**压缩消息**同样有效，消息在发送前已压缩，消费者解压即可
-- `file.0.0.0` 模式的 `.log` 文件直接内存映射（Memory Mapped），提供更快随机访问
-
----
-
-## 3. 生产者原理
-
-### 3.1 分区策略
-
-**默认分区器（DefaultPartitioner）：**
-
-- **Key 不为 null**：`murmur2(key) % numPartitions` 确定 Partition
-- **Key 为 null**：Round-Robin（粘性分桶策略 Sticky Partitioner，Kafka 2.4+）
-- **自定义分区器**：实现 `Partitioner` 接口，通过 `partitioner.class` 配置
-
-**粘性分桶（Sticky Partitioner）演进：**
-
-```
-旧版本（2.4 之前）：每次 send 轮询一个 Partition，产生大量小批次
-新版本（2.4+）：在一个批次未满期间，所有无 Key 消息发送到同一 Partition，提高批次利用率
-```
-
-**面试高频题：**
-
-> Q: 如何保证有序消息？如何保证将同一业务实体路由到同一 Partition？
-
-A: 两种方式：
-
-1. **Key 哈希**：为同一业务实体（如 orderId）设置相同的 Key，保证相同 Key 的消息进入同一 Partition
-2. **自定义分区器**：实现 `Partitioner.partition()` 方法，自定义路由逻辑
-
-关键约束：
-- 有序性只能在**单 Partition 内**保证
-- 增加 Partition 数量会破坏既有路由关系，需谨慎操作
-
-### 3.2 消息批次与压缩
-
-**生产者内存模型：**
-
-```
-Producer 实例
-├── accumulator: BufferPool       // 消息缓冲区
-│   ├── batch1 (TopicPartition-0)  // 未压缩
-│   ├── batch2 (TopicPartition-0)  // 压缩后
-│   └── batch3 (TopicPartition-1)
-└── sender: SenderThread          // 后台发送线程
-```
-
-- `buffer.memory`：生产者缓冲区总大小（默认 32MB）
-- `batch.size`：单个批次最大字节数（默认 16KB）
-- `max.request.size`：单次请求的最大字节数（默认 1MB）
-
-**压缩算法对比：**
-
-| 算法 | 压缩比 | CPU 开销 | 速度 | 适用场景 |
-|------|-------|---------|------|---------|
-| gzip | 高 | 高 | 慢 | 带宽受限、高压缩比要求 |
-| snappy | 中 | 低 | 快 | 吞吐优先，默认推荐 |
-| lz4 | 中 | 低 | 快 | 吞吐优先，与 snappy 相近 |
-| zstd | 最高 | 中 | 中快 | 追求极致压缩比，3.0+ 推荐 |
-
-**生产最佳实践：**
-
-- Producer 端压缩还是 Broker 端压缩？
-  - **Producer 端压缩**（推荐）：`compression.type=gzip|snappy|lz4|zstd`
-  - Broker 端压缩：`compression.type=producer`（默认），由 Producer 决定
-  - 如果 Broker 需要重新压缩（`compression.type` 与 Producer 不同），会增加 CPU 负载
-- 压缩 + 批处理结合使用效果最好
-- `max.request.size` 需同步调整消费者 `max.partition.fetch.bytes`
-
-### 3.3 幂等 Producer
-
-**开启方式：** `enable.idempotence=true`
-
-**原理：**
-
-```go
-// 幂等 Producer 请求协议字段（伪代码，对应 Kafka ProducerRequest）
-type ProducerRequest struct {
-    ProducerID     int64         // 服务端分配的 PID（首次请求返回）
-    ProducerEpoch  int16         // 每次 Producer 初始化递增，用于 fencing 旧 Producer
-    SequenceNumber int32         // 按 Partition 单调递增，从 0 开始
-    Data           []RecordBatch
-}
-// Broker 端：接受条件 sequenceNumber == expectedSeq+1，否则拒绝（重复或乱序）
-```
-
-- Broker 端维护 `<PID, Partition>` 维度的 `sequenceNumber` 状态
-- `sequenceNumber` = `expectedSeq + 1` 时接受，否则拒绝（重复或乱序）
-- Producer 崩溃恢复后获取新 PID 的 `producerEpoch`，旧 Producer 被 fencing
-
-**面试高频题：**
-
-> Q: 幂等 Producer 的局限性是什么？
-
-A:
-1. **只能保证单 Partition 内 Exactly Once**：跨 Partition 幂等需要事务 API
-2. **只能保证 Producer — Broker 间的 Exactly Once**：Consumer 端仍可能重复投递
-3. **只能在单 Session 内去重**：Producer 重启后 PID 变化，无法去重旧 PID 的未决消息
-4. **Broker 端状态不会无限保留**：`transaction.state.log.segment.bytes` 控制，超额后清理可能导致去重失败
-
-### 3.4 事务消息
-
-**配置参数：**
+ZooKeeper 集群需**奇数个节点**（3、5、7），遵循 `n = 2f + 1` 公式容忍 f 个节点故障。3 节点配置示例：
 
 ```properties
-# Producer 端
-transactional.id=my-transactional-id  # 唯一业务标识
-enable.idempotence=true               # 事务必须开启幂等
-transaction.timeout.ms=60000
+# conf/zoo.cfg
+tickTime=2000
+initLimit=10
+syncLimit=5
+dataDir=/data/zookeeper
+clientPort=2181
 
-# Consumer 端
-isolation.level=read_committed        # 只消费已提交事务消息
+# 集群成员（server.id=host:数据同步端口:选举端口）
+server.1=zk1:2888:3888
+server.2=zk2:2888:3888
+server.3=zk3:2888:3888
 ```
 
-**事务 API：**
+每个节点需在 `dataDir` 下创建 `myid` 文件，内容为该节点的 server.id：
 
-```go
-// Go kafka 客户端事务示例（使用 IBM/sarama 库）
-producer, _ := sarama.NewSyncProducer(brokers, config) // config.Producer.Transaction.ID = "my-tx-id"
-
-producer.BeginTxn()
-producer.SendMessage(&sarama.ProducerMessage{Topic: "topic-a", Key: sarama.StringEncoder(key), Value: sarama.ByteEncoder(value)})
-producer.SendMessage(&sarama.ProducerMessage{Topic: "topic-b", Key: sarama.StringEncoder(key), Value: sarama.ByteEncoder(value)})
-// 将消费者偏移量纳入事务（消费-转发场景）
-producer.AddOffsetsToTxn(offsets, consumerGroup)
-
-if err != nil {
-    producer.AbortTxn() // 回滚
-} else {
-    producer.CommitTxn() // 提交
-}
+```bash
+echo "1" > /data/zookeeper/myid   # zk1 上
+echo "2" > /data/zookeeper/myid   # zk2 上
+echo "3" > /data/zookeeper/myid   # zk3 上
 ```
 
-**事务状态流转：**
+### 3.3 启动与验证
 
+```bash
+# 每个节点启动
+bin/zkServer.sh start
+
+# 查看角色（leader / follower）
+bin/zkServer.sh status
+
+# 连接客户端验证
+bin/zkCli.sh -server zk1:2181
+[zk] ls /brokers/ids      # Kafka 启动后可见 Broker 列表
 ```
-EMPTY → ONGOING → COMMITTING_TRANSACTION → COMMITTED
-     → ONGOING → ABORTING_TRANSACTION  → ABORTED
-```
 
-- 事务协调器（Transaction Coordinator）负责管理状态
-- 事务日志存储在 `__transaction_state` 内部 Topic（默认 50 个 Partition）
-- `transaction.max.timeout.ms` 限制 Producer 的最大事务超时
+**【面试】ZooKeeper 的选举机制（ZAB 协议）简述？**
 
-**生产最佳实践：**
-
-- 事务消息用 `read_committed` 消费者会增加 Broker 端额外过滤开销
-- 高吞吐场景优先考虑**下游幂等**而非事务
-- 事务超时不要设置过大（建议 ≤ 120s），否则长时间未决事务会阻塞消费
+- ZooKeeper 使用 **ZAB（ZooKeeper Atomic Broadcast）** 协议保证一致性
+- 选举时比较 `(epoch, zxid, myid)`：优先选 epoch 最大、事务 ID（zxid）最新、myid 最大的节点为 Leader
+- 需要**多数派（Quorum）** 同意，因此节点数必须为奇数
+- Leader 负责写请求并广播给 Follower，Follower 可处理读请求
 
 ---
 
-## 4. 消费者原理
+## 4. 搭建并使用 Kafka 集群
 
-### 4.1 消费者组重平衡（Rebalance）
+### 4.1 集群配置（ZK 模式）
+
+3 个 Broker 的核心配置差异在 `broker.id`、`listeners` 和共享的 `zookeeper.connect`：
+
+```properties
+# server.properties（broker-1）
+broker.id=1
+listeners=PLAINTEXT://kafka1:9092
+log.dirs=/data/kafka/data
+zookeeper.connect=zk1:2181,zk2:2181,zk3:2181/kafka
+
+# 副本与可靠性默认值（生产建议）
+default.replication.factor=3
+min.insync.replicas=2
+unclean.leader.election.enable=false
+num.partitions=3
+```
+
+> `zookeeper.connect` 末尾的 `/kafka` 是 **chroot**，让多个 Kafka 集群共用一套 ZK 时互不干扰。
+
+### 4.2 集群配置（KRaft 模式，推荐）
+
+```properties
+# 混合节点（小集群 ≤3 节点）
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+listeners=PLAINTEXT://kafka1:9092,CONTROLLER://kafka1:9093
+
+# 大规模集群推荐分离：独立 Controller + 独立 Broker
+# Controller 节点：process.roles=controller
+# Broker 节点：    process.roles=broker
+```
+
+### 4.3 Topic 管理实操
+
+```bash
+# 创建生产级 Topic（多分区 + 3 副本）
+bin/kafka-topics.sh --create --topic order-events \
+  --partitions 12 --replication-factor 3 \
+  --config min.insync.replicas=2 \
+  --config retention.ms=604800000 \
+  --bootstrap-server kafka1:9092
+
+# 增加分区（注意：会破坏既有 Key 路由，需谨慎）
+bin/kafka-topics.sh --alter --topic order-events \
+  --partitions 24 --bootstrap-server kafka1:9092
+
+# 动态修改 Topic 配置
+bin/kafka-configs.sh --alter --topic order-events \
+  --add-config retention.ms=259200000 \
+  --bootstrap-server kafka1:9092
+```
+
+### 4.4 集群健康验证
+
+```bash
+# 查看分区副本分布与 ISR
+bin/kafka-topics.sh --describe --topic order-events \
+  --bootstrap-server kafka1:9092
+# 重点关注：Leader / Replicas / Isr 三列是否齐全
+
+# 查看 Broker 与 Controller（KRaft）
+bin/kafka-metadata-quorum.sh --bootstrap-server kafka1:9092 describe --status
+```
+
+**【面试】副本（replica）应该如何分配到 Broker？**
+
+Kafka 默认采用**机架感知（rack-aware）+ 轮询**的副本分配算法：
+- 每个分区的多个副本尽量分布在**不同 Broker**（容忍单机故障）
+- 配置 `broker.rack` 后，副本尽量分布在**不同机架**（容忍整机架故障）
+- AR 列表的第一个副本是 **Preferred Leader（优先副本）**，正常情况下应作为 Leader，便于负载均衡
+
+---
+
+# 篇二 · 客户端开发详解
+
+## 5. 基础客户端开发流程
+
+### 5.1 生产者开发流程
+
+标准的生产者使用分五步：配置 → 创建 → 构造消息 → 发送 → 关闭。
+
+```java
+// Java 原生客户端
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka1:9092,kafka2:9092");
+props.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer");
+props.put("acks", "all");
+
+Producer<String, String> producer = new KafkaProducer<>(props);
+ProducerRecord<String, String> record =
+    new ProducerRecord<>("order-events", "order-123", "{...}");
+
+// 异步发送 + 回调（推荐，不要 fire-and-forget）
+producer.send(record, (metadata, exception) -> {
+    if (exception != null) {
+        log.error("发送失败", exception);
+    } else {
+        log.info("分区={} 偏移量={}", metadata.partition(), metadata.offset());
+    }
+});
+producer.close();   // flush 缓冲区并释放资源
+```
+
+**三种发送方式对比：**
+
+| 方式 | 写法 | 特点 |
+|------|------|------|
+| Fire-and-forget | `send(record)` | 不关心结果，可能丢消息，不推荐 |
+| 同步发送 | `send(record).get()` | 阻塞等待 ack，可靠但吞吐低 |
+| 异步发送 | `send(record, callback)` | 非阻塞 + 回调处理失败，**推荐** |
+
+### 5.2 消费者开发流程
+
+```java
+Properties props = new Properties();
+props.put("bootstrap.servers", "kafka1:9092");
+props.put("group.id", "order-consumer-group");
+props.put("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+props.put("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
+props.put("enable.auto.commit", "false");   // 手动提交（推荐）
+props.put("auto.offset.reset", "earliest");
+
+KafkaConsumer<String, String> consumer = new KafkaConsumer<>(props);
+consumer.subscribe(Arrays.asList("order-events"));
+
+try {
+    while (true) {
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+        for (ConsumerRecord<String, String> record : records) {
+            process(record);                 // 先处理
+        }
+        consumer.commitSync();               // 再提交（至少一次语义）
+    }
+} finally {
+    consumer.close();
+}
+```
+
+### 5.3 Go 客户端（sarama）等价实现
+
+```go
+// 生产者（IBM/sarama）
+config := sarama.NewConfig()
+config.Producer.RequiredAcks = sarama.WaitForAll      // acks=all
+config.Producer.Return.Successes = true
+producer, _ := sarama.NewSyncProducer([]string{"kafka1:9092"}, config)
+partition, offset, err := producer.SendMessage(&sarama.ProducerMessage{
+    Topic: "order-events",
+    Key:   sarama.StringEncoder("order-123"),
+    Value: sarama.StringEncoder("{...}"),
+})
+
+// 消费者组（实现 ConsumerGroupHandler 接口）
+group, _ := sarama.NewConsumerGroup([]string{"kafka1:9092"}, "order-consumer-group", config)
+group.Consume(ctx, []string{"order-events"}, &handler{})
+```
+
+**`auto.offset.reset` 三个取值：**
+
+| 取值 | 行为 |
+|------|------|
+| `earliest` | 无有效 offset 时从最早消息开始 |
+| `latest`（默认） | 无有效 offset 时从最新消息开始 |
+| `none` | 无有效 offset 时抛异常 |
+
+---
+
+## 6. 消费者分组消费机制详解
+
+### 6.1 Consumer Group 模型
+
+```
+Topic（4 个 Partition）
+P0 P1 P2 P3
+ │  │  │  │
+ ▼  ▼  ▼  ▼
+Group-A: C1(P0,P1)  C2(P2,P3)   ← 组内分摊，负载均衡
+Group-B: C3(P0,P1,P2,P3)        ← 另一组独立消费全量
+```
+
+核心规则：
+- **同一 Partition 在一个 Group 内只会被一个 Consumer 消费**（保证组内不重复）
+- 不同 Group 之间相互独立，各自消费全量消息（广播效果）
+- Consumer 数 > Partition 数时，多出的 Consumer **空闲**（无分区可分）
+
+### 6.2 Rebalance（重平衡）
 
 **触发条件：**
 
 1. 新 Consumer 加入组
-2. Consumer 主动离开（`leaveGroup`）或超时（`session.timeout.ms`）
-3. Partition 数量变化
-4. Topic 订阅正则匹配到新增/删除 Topic
+2. Consumer 主动离开（`leaveGroup`）或心跳超时（`session.timeout.ms`，默认 45s）
+3. Consumer 消费超时（`max.poll.interval.ms`，默认 5min）被踢出
+4. Topic 的 Partition 数量增加
+5. 订阅的 Topic 集合变化（正则订阅匹配到新 Topic）
 
-**重平衡策略（`partition.assignment.strategy`）：**
+**分配策略（`partition.assignment.strategy`）：**
 
 | 策略 | 类名 | 特点 |
 |------|------|------|
 | Range（默认） | `RangeAssignor` | 按 Topic 顺序连续分配，可能不均匀 |
 | RoundRobin | `RoundRobinAssignor` | 轮询分配，较均匀 |
-| Sticky | `StickyAssignor` | 在 Rebalance 时尽量保持已有分配，2.3+ 推荐 |
-| Cooperative Sticky | `CooperativeStickyAssignor` | 增量式 Rebalance，避免 Stop The World，3.0+ 推荐 |
+| Sticky | `StickyAssignor` | Rebalance 时尽量保持已有分配，2.3+ |
+| Cooperative Sticky | `CooperativeStickyAssignor` | 增量式 Rebalance，避免 STW，**3.0+ 推荐** |
 
 **Eager vs. Cooperative Rebalance：**
 
@@ -420,1115 +458,980 @@ Eager Rebalance（旧）:
 全体 Consumer 撤销所有 Partition → 停止消费 → 重新分配 → 恢复消费
                  [stop the world]
 
-Cooperative Rebalance（新，Kafka 2.3+）:
-Consumer1 撤销部分 Partition → 重新分配 → Consumer2 接管
-                [增量式，不停顿]
+Cooperative Rebalance（新，2.3+）:
+Consumer1 仅撤销需要转移的 Partition → 重新分配 → Consumer2 接管
+                [增量式，未受影响的分区不停顿]
 ```
 
-**面试高频题：**
+**【面试】如何减少 Rebalance 对业务的影响？如何诊断频繁 Rebalance？**
 
-> Q: 如何减少 Rebalance 对业务的影响？如何诊断频繁 Rebalance？
-
-A:
-
-**减少影响的措施：**
+减少影响：
 1. 使用 `CooperativeStickyAssignor` 替代 Range/RoundRobin
-2. 合理设置 `session.timeout.ms`（默认 45s）和 `heartbeat.interval.ms`（默认 3s）
-3. 避免 Consumer 在 polls 间隔内处理过长逻辑，或适当增大 `max.poll.interval.ms`
-4. `group.initial.rebalance.delay.ms` 设置合理值（如 3s）避免空转 Topic 频繁 Rebalance
-5. 静态成员 `group.instance.id` 让 Consumer 以固定 ID 注册，重启不触发 Rebalance
+2. 合理设置 `session.timeout.ms`（默认 45s）与 `heartbeat.interval.ms`（默认 3s，约为 session 的 1/3）
+3. 避免 poll 间隔内处理过长，或调大 `max.poll.interval.ms` / 减小 `max.poll.records`
+4. 使用**静态成员** `group.instance.id`，让 Consumer 以固定 ID 注册，重启不触发 Rebalance
+5. `group.initial.rebalance.delay.ms` 设置合理值（如 3s），避免启动期频繁 Rebalance
 
-**诊断方法：**
-1. 监控 `kafka.consumer:type=consumer-coordinator-metrics` 中的 `rebalance-total` 和 `rebalance-rate-per-hour`
-2. 检查 Broker 日志 `[GroupCoordinator ...]: ...` 中的 Rebalance 原因
-3. 检查 Consumer 端 `max.poll.interval.ms` 是否超过实际处理时间
+诊断：
+1. 监控 `consumer-coordinator-metrics` 的 `rebalance-rate-per-hour`（> 10/h 需警惕）
+2. 检查 Broker 端 `[GroupCoordinator]` 日志中的 Rebalance 原因
+3. 核对 `max.poll.records × 单条处理耗时` 是否超过 `max.poll.interval.ms`
 
-### 4.2 Coordinator
+### 6.3 Coordinator（消费者组协调器）
 
-**面试高频题：**
-
-> Q: GroupCoordinator 是如何选举出来的？消费者如何找到它的 Coordinator？
-
-A:
-
-**确定 Coordinator 的流程：**
+**【面试】GroupCoordinator 如何确定？消费者如何找到它？**
 
 ```
-// 1. 消费者计算 group.id 的哈希值
-groupIdHash = hash("my-consumer-group") % groupMetadataTopicPartitionCount
+// 1. 对 group.id 哈希，对 __consumer_offsets 分区数取模
+coordinatorPartition = hash("my-group") % offsets.topic.num.partitions(默认 50)
 
-// 2. 确定 __consumer_offsets 的目标 Partition
-coordinatorPartition = groupIdHash % __consumer_offsets 的 Partition 数（默认50）
-
-// 3. 查询该 Partition 的 Leader 所在的 Broker → 这就是 GroupCoordinator
+// 2. 该 Partition 的 Leader 所在 Broker 即为该 Group 的 GroupCoordinator
 ```
 
-**Coordinator 的职责：**
-- 管理消费者组成员注册与注销
-- 触发和协调 Rebalance
-- 管理偏移量提交和读取（存储在 `__consumer_offsets`）
-- 管理事务状态（Transaction Coordinator 共用部分逻辑）
+Coordinator 职责：管理成员注册/注销、触发并协调 Rebalance、管理偏移量提交与读取（存于 `__consumer_offsets`）。
 
-**源码位置：**
+### 6.4 偏移量（Offset）管理
 
-```scala
-// kafka.coordinator.group.GroupCoordinator.scala
-class GroupCoordinator(
-  brokerId: Int,
-  groupConfig: GroupConfig,
-  replicaManager: ReplicaManager,
-  offsetConfig: OffsetConfig,
-  groupManager: GroupMetadataManager,
-  heartbeatPurgatory: DelayedOperationPurgatory[DelayedHeartbeat],
-  rebalancePurgatory: DelayedOperationPurgatory[DelayedRebalance],
-  time: Time,
-  metrics: Metrics
-) extends Logging {
-  // ...
-  def handleJoinGroup(...): Unit   // 处理加入组请求
-  def handleSyncGroup(...): Unit   // 处理同步组请求
-  def handleLeaveGroup(...): Unit  // 处理离开组请求
-  def handleCommitOffsets(...): Unit
-  def handleFetchOffsets(...): Unit
-}
-```
-
-### 4.3 偏移量管理
-
-**存储机制：**
-
-- 2.0+ **默认**提交到 `__consumer_offsets` 内部 Topic（而非 ZooKeeper）
-- 偏移量提交 Key：`<groupId, topic, partition>`
-- 偏移量提交 Value：`<offset, metadata, timestamp>`
+**存储机制：** 2.0+ 默认提交到内部 Topic `__consumer_offsets`（而非 ZooKeeper）。
+- Key：`<groupId, topic, partition>`
+- Value：`<offset, leaderEpoch, metadata, commitTimestamp>`
 
 **提交方式：**
 
 | 方式 | API | 说明 |
 |------|-----|------|
-| 自动提交 | `enable.auto.commit=true` | 定时提交，`auto.commit.interval.ms` 默认 5s |
-| 手动同步提交 | `consumer.commitSync()` | 阻塞直到提交成功 |
-| 手动异步提交 | `consumer.commitAsync()` | 非阻塞，回调处理失败 |
-| 提交指定偏移 | `consumer.commitSync(offsetsMap)` | 精细控制，需要自定义偏移量 |
+| 自动提交 | `enable.auto.commit=true` | 定时提交，`auto.commit.interval.ms` 默认 5s，有丢/重风险 |
+| 手动同步 | `commitSync()` | 阻塞直到成功，自动重试 |
+| 手动异步 | `commitAsync()` | 非阻塞，回调处理失败，不重试 |
+| 提交指定偏移 | `commitSync(offsetsMap)` | 精细控制 |
 
-**面试高频题：**
+**【面试】`commitAsync` 和 `commitSync` 如何配合？**
 
-> Q: `commitAsync` 和 `commitSync` 应该如何配合使用？
+推荐：正常循环用 `commitAsync`（高吞吐），关闭前最终提交用 `commitSync`（确保落地）。
 
-A: 推荐模式：正常处理循环使用 `commitAsync`，关闭 Consumer 前的最终提交使用 `commitSync`。
-
-```go
-// 正常循环用异步提交（非阻塞，高吞吐）
-for {
-    records, _ := consumer.ReadMessage(ctx)
-    process(records)
-    consumer.CommitOffsets() // sarama: 异步批量提交
+```java
+try {
+    while (running) {
+        ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
+        process(records);
+        consumer.commitAsync();        // 正常循环：异步，不阻塞
+    }
+} finally {
+    try {
+        consumer.commitSync();         // 关闭前：同步，确保最终偏移量落地
+    } finally {
+        consumer.close();
+    }
 }
-
-// 关闭前用同步提交确保最终偏移量落地
-defer func() {
-    consumer.CommitOffsets() // 同步等待完成
-    consumer.Close()
-}()
 ```
 
-### 4.4 再均衡监听器（RebalanceListener）
+### 6.5 消息重复 / 丢失的成因与对策
 
-**面试高频题：**
+| 问题 | 根因 | 解决方案 |
+|------|------|----------|
+| 消息丢失 | 自动提交 + 消费未完成就触发 Rebalance | 关闭自动提交，先处理再提交 |
+| 消息重复 | 处理完成后、提交前发生 Rebalance/宕机 | 业务幂等、去重表、Kafka 事务 |
+| 消费超时踢出 | 单批处理耗时 > `max.poll.interval.ms` | 调大超时、减小 `max.poll.records`、异步处理 |
+| Rebalance 风暴 | 频繁心跳超时或成员抖动 | 静态成员 + CooperativeSticky + 调大超时 |
 
-> Q: 如何在 Rebalance 时优雅地处理未完成的消息？请给出代码模式。
+### 6.6 再均衡监听器（RebalanceListener）
 
-A: 使用 `ConsumerRebalanceListener`，在分区撤销前（`onPartitionsRevoked`）提交偏移量，在分区分配后（`onPartitionsAssigned`）重新初始化资源。
+**【面试】如何在 Rebalance 时优雅处理未完成的消息？**
 
-```go
-// sarama ConsumerGroup Handler 实现再均衡回调
-type orderHandler struct {
-    currentOffsets map[string][]*sarama.PartitionOffsetManager
-}
+在分区被撤销前（`onPartitionsRevoked`）提交偏移量，在分区分配后（`onPartitionsAssigned`）恢复状态：
 
-// Rebalance 前触发：提交偏移量防止重复消费
-func (h *orderHandler) Cleanup(sess sarama.ConsumerGroupSession) error {
-    sess.Commit() // 提交当前所有偏移量
-    // 清理分区相关资源（本地状态、数据库连接等）
-    return nil
-}
-
-// 新分区分配后触发：恢复处理状态
-func (h *orderHandler) Setup(sess sarama.ConsumerGroupSession) error {
-    for _, partitions := range sess.Claims() {
-        for _, partition := range partitions {
-            // 从外部存储恢复偏移量，覆盖 Broker 端记录
-            offset := externalStore.ReadOffset(partition)
-            sess.ResetOffset("topic", partition, offset, "")
+```java
+consumer.subscribe(topics, new ConsumerRebalanceListener() {
+    @Override
+    public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+        consumer.commitSync(currentOffsets);   // 撤销前提交，防止重复消费
+    }
+    @Override
+    public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+        for (TopicPartition tp : partitions) {
+            consumer.seek(tp, externalStore.readOffset(tp));   // 从外部存储恢复
         }
     }
-    return nil
-}
+});
+```
 
-func (h *orderHandler) ConsumeClaim(sess sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
-    for msg := range claim.Messages() {
-        process(msg)
-        sess.MarkMessage(msg, "") // 标记消费，下次 Commit 生效
+---
+
+## 7. 生产者拦截器机制详解
+
+### 7.1 ProducerInterceptor 接口
+
+拦截器允许在消息**发送前**和**收到 ack 后**插入自定义逻辑，无需修改业务代码。
+
+```java
+public interface ProducerInterceptor<K, V> {
+    // 消息序列化和分区分配之前调用（可修改消息）
+    ProducerRecord<K, V> onSend(ProducerRecord<K, V> record);
+    // 消息被 ack 或发送失败时调用（统计、监控）
+    void onAcknowledgement(RecordMetadata metadata, Exception exception);
+    void close();
+}
+```
+
+执行时机：
+
+```
+producer.send()
+  → onSend()           ← 拦截器：可改写/打标 record
+  → 序列化
+  → 分区器选分区
+  → 累加器缓存 → Sender 发送
+  → onAcknowledgement() ← 拦截器：成功/失败回调（在 Sender 线程执行）
+```
+
+### 7.2 典型应用场景
+
+| 场景 | 实现 |
+|------|------|
+| 统一打标签 | `onSend` 给 Header 注入 traceId、租户 ID |
+| 全链路追踪 | 注入 OpenTelemetry trace context |
+| 发送统计 | `onAcknowledgement` 统计成功率、延迟分布 |
+| 消息审计 | 记录敏感 Topic 的发送方与内容摘要 |
+
+### 7.3 配置与链式拦截器
+
+```java
+// 可配置多个拦截器，按列表顺序形成拦截链
+props.put("interceptor.classes", Arrays.asList(
+    "com.example.TraceInterceptor",
+    "com.example.MetricsInterceptor"
+));
+```
+
+**注意事项：**
+- `onAcknowledgement` 在 **Sender 线程**执行，逻辑必须轻量，否则拖慢发送
+- 拦截器抛出的异常会被捕获并记录日志，**不会中断发送**（不影响主流程）
+- 拦截链中某个拦截器对 record 的修改，会传递给下一个拦截器
+
+---
+
+## 8. 消息序列化机制
+
+### 8.1 序列化器与反序列化器
+
+Kafka 只传输字节数组，Key/Value 在发送前需序列化、消费时需反序列化。
+
+```java
+public interface Serializer<T> {
+    byte[] serialize(String topic, T data);
+}
+public interface Deserializer<T> {
+    T deserialize(String topic, byte[] data);
+}
+```
+
+**内置序列化器：** `StringSerializer`、`IntegerSerializer`、`LongSerializer`、`ByteArraySerializer`、`ByteBufferSerializer`、`DoubleSerializer` 等。
+
+### 8.2 序列化方案对比
+
+| 方案 | 体积 | 跨语言 | Schema 演进 | 可读性 | 适用 |
+|------|------|--------|------------|--------|------|
+| JSON | 大 | 好 | 弱 | 高 | 调试友好、Schema 不严格 |
+| Avro | 小 | 好 | **强**（Schema Registry） | 低 | 大数据生态首选 |
+| Protobuf | 小 | 好 | 强 | 低 | gRPC 生态、强类型 |
+| Thrift | 小 | 好 | 强 | 低 | 老牌 RPC 生态 |
+| Java 原生序列化 | 大 | **差** | 弱 | 低 | 不推荐（跨语言不可用） |
+
+### 8.3 自定义序列化器
+
+```java
+public class OrderSerializer implements Serializer<Order> {
+    private final ObjectMapper mapper = new ObjectMapper();
+    @Override
+    public byte[] serialize(String topic, Order order) {
+        if (order == null) return null;
+        try {
+            return mapper.writeValueAsBytes(order);
+        } catch (Exception e) {
+            throw new SerializationException("序列化 Order 失败", e);
+        }
     }
-    return nil
 }
+// 使用
+props.put("value.serializer", "com.example.OrderSerializer");
 ```
 
-**生产最佳实践：**
+### 8.4 Schema Registry（Schema 注册中心）
 
-- **至少一次语义**：业务处理成功后再提交偏移量
-- **避免重复处理**：如果业务处理在 commit 之后、存储完成之前失败，会触发重复消费，需要**下游幂等**
-- **偏移量回退**：通过 `consumer.seek()` 可以回溯到任意偏移量重放消息
+**【面试】生产环境为什么需要 Schema Registry？**
 
----
+在大规模数据管道中，生产者与消费者由不同团队维护，消息结构会持续演进。Schema Registry（Confluent / Apicurio）解决：
 
-## 5. 副本机制
-
-### 5.1 ISR / OSR
-
-**面试高频题：**
-
-> Q: 解释 ISR、OSR、AR 的概念。ISR 的判定标准是什么？
-
-A:
-
-- **AR（Assigned Replicas）**：Partition 的所有副本列表
-- **ISR（In-Sync Replicas）**：与 Leader 保持同步的副本集合
-- **OSR（Out-of-Sync Replicas）**：与 Leader 不同步的副本集合，即 AR - ISR
-
-**ISR 判定标准：**
-
-Follower 副本需满足以下条件才能留在 ISR 中：
+- **Schema 集中管理**：消息体只携带 Schema ID（几字节），而非完整 Schema，节省带宽
+- **兼容性校验**：注册新 Schema 时检查兼容性（BACKWARD / FORWARD / FULL），防止破坏下游
+- **演进安全**：
+  - `BACKWARD`：新 Schema 可读旧数据（最常用，可先升级消费者）
+  - `FORWARD`：旧 Schema 可读新数据（可先升级生产者）
+  - `FULL`：双向兼容
 
 ```
-replica.lag.time.max.ms = 30000（默认）
-```
-
-- 在 `replica.lag.time.max.ms` 时间内 Follower 向 Leader 发起过 **fetch 请求**
-- 注意：Kafka 0.9+ 不再通过消息条数判断延迟，只通过请求时间判断
-- 如果 Follower 超过 `replica.lag.time.max.ms` 未 Fetch，被踢出 ISR
-- 重新追上后自动加回 ISR
-
-**源码关键逻辑：**
-
-```scala
-// kafka.cluster.Partition.scala
-private def maybeShrinkIsr(): Unit = {
-  val leaderLog = log.getOrElse {
-    warn(s"Trying to shrink ISR for partition $topicPartition with no leader log")
-    return
-  }
-  val leaderLogEndOffset = leaderLog.logEndOffset
-  val currentIsr = inSyncReplicas.read
-  
-  // 找出不同步的副本
-  val outOfSyncReplicas = currentIsr.filter { replica =>
-    replica.logEndOffset == -1 ||  // 没有数据
-    (leaderLogEndOffset - replica.logEndOffset) > 0 ||  // 落后
-    (time.milliseconds() - replica.lastFetchTimeMs) > configs.replicaLagTimeMaxMs  // 超时未Fetch
-  }
-  
-  if (outOfSyncReplicas.nonEmpty) {
-    val newIsr = currentIsr -- outOfSyncReplicas.toSet
-    // 更新 ISR 到 ZooKeeper（或 KRaft 元数据日志）
-    updateIsr(newIsr)
-    isrChangeListener.onIsrChange(topicPartition, newIsr.toList)
-  }
-}
-```
-
-### 5.2 HW / LEO
-
-**面试高频题：**
-
-> Q: 解释 HW、LEO 的含义及其在副本同步中的作用。Consumer 能读到 HW 以内的数据还是 LEO 以内的数据？
-
-A:
-
-- **LEO（Log End Offset）**：当前副本的最后一条消息的下一个位置
-- **HW（High Watermark）**：所有 ISR 副本都同步到的 Offset，Consumer 只能读到 HW 之前的数据
-- **LW（Low Watermark）**：日志清理后 Partition 的第一条消息偏移量
-
-**同步流程：**
-
-```
-                    Leader                    Follower 1         Follower 2
-LEO:                |10|                      |8|                |5|
-ISR: {Leader, F1, F2}
-HW = min(Leader.LEO, F1.LEO, F2.LEO) = min(10, 8, 5) = 5
-Consumer 可见范围: offset < 5
-```
-
-**HW 更新机制：**
-
-1. Follower 向 Leader 发送 FetchRequest
-2. Leader 在返回数据时，附带当前 Leader 的 LEO
-3. Follower 收到响应后更新其 HW = min(已同步的 LEO, Leader LEO)
-4. Leader 侧 HW = min(Leader LEO, 所有 ISR 副本的 LEO)
-
-**源码关键路径：**
-
-```scala
-// kafka.cluster.Partition.scala
-// Leader 更新 HW 的逻辑
-def updateLeaderHWAndMaybeShrinkISR(): Unit = {
-  // 取所有 ISR 副本的最小 LEO
-  val leo = leaderLog.logEndOffset  // Leader 的 LEO
-  val minIsrLeo = isrReplicas.map(_.logEndOffset).min
-  val newHw = math.min(leo, minIsrLeo.value)
-  
-  if (newHw > leaderLog.highWatermark) {
-    leaderLog.updateHighWatermark(newHw)
-    // 通知等待的消费者：有新数据可读了
-    leaderLog.maybeIncrementHighWatermark(newHw)
-  }
-}
-```
-
-### 5.3 Leader Epoch
-
-**面试高频题：**
-
-> Q: Kafka 0.11 引入 Leader Epoch 的作用是什么？解决了什么问题？
-
-A: Leader Epoch 解决 HW 截断机制导致的**数据丢失**和**数据不一致**问题。
-
-**问题场景：**
-
-```
-初始: Leader(0), Follower(1), HW=5, LEO=10
-
-Step 1: Leader 接收新消息，LEO=12，HW 未更新（Follower 落后）
-Step 2: Leader 宕机，Follower 成为新 Leader，HW=5
-Step 3: 原 Leader 恢复，发现 HW=5，截断 LEO 到 5 → 数据丢失！
-```
-
-**Leader Epoch 解决方案：**
-
-```
-每个 Leader 任期记录：<epoch, startOffset>
-Leader 在恢复时，Follower 提供 epoch 信息而不是 HW：
-  → 新 Leader 告知 epoch 对应的起始偏移量
-  → 旧 Leader 截断到该偏移量，而不是 HW
-```
-
-**源码：**
-
-```scala
-// kafka.server.epoch.LeaderEpochFileCache
-// epoch 缓存存储在 leader-epoch-checkpoint 文件中
-class LeaderEpochFileCache(topicPartition: TopicPartition, ...) {
-  // epoch => startOffset 映射
-  // 如: [(0, 0), (1, 100), (2, 200)] 
-  // epoch 0: offset 0 开始
-  // epoch 1: offset 100 开始
-  // epoch 2: offset 200 开始
-  
-  def assign(epoch: Int, startOffset: Long): Unit
-  def latestEpoch(): Option[Int]
-  def endOffsetFor(epoch: Int): Option[Long]
-}
-```
-
-**生产最佳实践：**
-
-- 升级到 Kafka 2.8+ 获取最新 Leader Epoch 改进
-- 配合 `unclean.leader.election.enable=false` 保证数据一致性
-
-### 5.4 不完全 Leader 选举（Unclean Leader Election）
-
-**面试高频题：**
-
-> Q: `unclean.leader.election.enable` 设置为 true 或 false 分别有什么影响？
-
-A:
-
-| 配置值 | 行为 | 数据一致性 | 可用性 |
-|--------|------|-----------|--------|
-| `false`（推荐） | 只允许 ISR 中的副本成为 Leader | 强一致 | 降低（ISR 全部下线时不可用） |
-| `true` | 允许 OSR 副本成为 Leader | 弱一致 | 提高（有副本即可领选） |
-
-**选择建议：**
-
-- **核心业务/金融系统**：`unclean.leader.election.enable=false`，宁可不可用也不能丢数据
-- **日志收集/可观测**：`unclean.leader.election.enable=true`，可用性优先
-- **预防措施**：`min.insync.replicas` 配合使用，保证至少 N 个 ISR 副本
-
-```properties
-# 典型生产配置
-unclean.leader.election.enable=false
-min.insync.replicas=2
-default.replication.factor=3
+Producer → 序列化(Avro) → 向 Registry 注册/查询 Schema ID
+        → 消息 = [magic byte][schema id][avro payload] → Kafka
+Consumer → 取 schema id → 向 Registry 拉取 Schema → 反序列化
 ```
 
 ---
 
-## 6. 控制器与协调器
+## 9. 消息分区路由机制
 
-### 6.1 Controller 选举与职责
+### 9.1 默认分区器（DefaultPartitioner）
 
-**面试高频题：**
+消息最终落到哪个 Partition，由分区器决定：
 
-> Q: Controller 在 Kafka 集群中扮演什么角色？Controller 宕机后如何恢复？
+| 情况 | 路由规则 |
+|------|---------|
+| 指定了 `partition` | 直接使用指定分区 |
+| 未指定 partition、**Key 不为 null** | `murmur2(key) % numPartitions`（相同 Key 必到同一分区） |
+| 未指定 partition、**Key 为 null** | 粘性分区（Sticky Partitioner，2.4+） |
 
-A: **Controller 职责：**
-
-- 管理 Partition 的 Leader 选举
-- 监听 Broker 上下线，触发分区重分配
-- 管理元数据变更（创建/删除 Topic、增删 Partition）
-- 将元数据变更同步到所有 Broker
-
-**选举机制：**
-
-Kafka 2.8 前依赖 ZooKeeper：
+### 9.2 粘性分区（Sticky Partitioner）
 
 ```
-1. 所有 Broker 尝试在 ZK 创建 /controller 临时节点
-2. 第一个创建成功的成为 Controller
-3. Controller 在 ZK 注册 Watcher 监听 /controller 节点
-4. Controller 宕机 → 临时节点消失 → Watcher 通知其他 Broker
-5. 所有 Broker 再次竞争创建 /controller 节点
+旧版本（2.4 之前）：无 Key 消息每次轮询一个 Partition → 产生大量小批次，吞吐低
+新版本（2.4+）：在一个批次未满期间，无 Key 消息都发往同一 Partition
+              → 批次填满后才换分区，提高批次利用率，降低延迟
 ```
 
-Kafka 3.x+（KRaft）不依赖 ZK，使用基于 Raft 的选举（见 KRaft 章节）。
+### 9.3 自定义分区器
 
-**Controller 的唯一性保证：**
-
-- 通过 ZK 的**临时节点 + 递增 epoch** 保证
-- 每个 Controller 消息包含 `controller_epoch`，Broker 只接受更高 epoch 的消息
-- 出现僵尸 Controller 时，其请求因 epoch 较低被拒绝
-
-### 6.2 GroupCoordinator
-
-已在 4.2 节详述。此处补充内部 Topic 结构。
-
-`__consumer_offsets` 内部 Topic 的消息格式（Kafka 2.0+）：
-
-```
-Key:   [groupId, topic, partition]
-Value: [offset, leaderEpoch, metadata, commitTimestamp, metadataVersion]
-
-// 当 group.id=my-group, topic=my-topic, partition=0 时
-// offsets 存储在 __consumer_offsets-{hash} 的某个 Partition 中
-```
-
-**生产最佳实践：**
-
-- `offsets.topic.num.partitions`（默认 50）— 如果 Consumer Group 数量很大（>1000），应调大
-- `offsets.topic.replication.factor`（默认 3）— 生产环境至少 3
-- `offsets.retention.minutes`（默认 10080 = 7天）— Group 下线后的偏移量保留时间
-
-### 6.3 元数据管理
-
-**元数据自动刷新：**
-
-- 生产者端：`metadata.max.age.ms`（默认 300s），定期刷新
-- 消费者端：每次 `poll()` 时附带元数据请求
-- 服务端：Controller 推送元数据变更到所有 Broker
-
-**元数据内容：**
-
-```json
-{
-  "brokers": [
-    {"id": 0, "host": "kafka-0", "port": 9092},
-    {"id": 1, "host": "kafka-1", "port": 9092}
-  ],
-  "topics": {
-    "order-events": [
-      {"partition": 0, "leader": 0, "replicas": [0, 1, 2], "isr": [0, 1]},
-      {"partition": 1, "leader": 1, "replicas": [1, 2, 0], "isr": [1, 2]}
-    ]
-  },
-  "controller_id": 0
+```java
+public class OrderPartitioner implements Partitioner {
+    @Override
+    public int partition(String topic, Object key, byte[] keyBytes,
+                         Object value, byte[] valueBytes, Cluster cluster) {
+        int numPartitions = cluster.partitionsForTopic(topic).size();
+        // 例：VIP 订单固定路由到 0 号分区
+        if (key != null && key.toString().startsWith("VIP")) {
+            return 0;
+        }
+        return Math.abs(Utils.murmur2(keyBytes)) % numPartitions;
+    }
 }
+props.put("partitioner.class", "com.example.OrderPartitioner");
 ```
+
+### 9.4 有序性保证
+
+**【面试】如何保证消息有序？如何把同一业务实体路由到同一 Partition？**
+
+1. **Key 哈希**：为同一业务实体（如 orderId）设置相同 Key，相同 Key 必进同一 Partition，Partition 内有序
+2. **自定义分区器**：实现 `partition()` 自定义路由
+
+关键约束：
+- 有序性只能在**单 Partition 内**保证，跨 Partition 无序
+- 重试可能打乱顺序：需设 `max.in.flight.requests.per.connection=1`，**或** 开启幂等（`enable.idempotence=true`，此时即使 `max.in.flight=5` 也能保证单分区有序）
+- 增加 Partition 数量会破坏既有 Key 路由关系，需谨慎
+
+**分区倾斜**：Key 分布不均会导致部分分区/Broker 过热。对策：检查分区策略、必要时加随机盐值或改用自定义分区器。
 
 ---
 
-## 7. KRaft 模式
+## 10. 生产者消息缓存机制
 
-### 7.1 去 ZooKeeper 架构
+### 10.1 RecordAccumulator 内存模型
 
-**演进历史：**
-
-| 版本 | 依赖 | 架构 |
-|------|------|------|
-| 0.8.x - 2.7.x | ZooKeeper 必选 | Controller + ZK 管理元数据 |
-| 2.8.x - 3.2.x | ZooKeeper 可选 | KRaft 预览/Migration 模式（ZK + KRaft 共存） |
-| 3.3.x+ | ZK 可选 | KRaft 生产可用，ZK 模式仍支持 |
-| 4.0+ | **仅 KRaft** | ZK 模式彻底移除 |
-
-**架构变化：**
+生产者并非每条消息都立即发送，而是先攒批到缓存区，由后台 Sender 线程批量发出。
 
 ```
-旧架构（ZK 模式）:
-                  ZooKeeper
-                 /    |    \
-                /     |     \
-         Broker1  Controller  Broker2
-          (Leader选举, 元数据存储)
-
-新架构（KRaft 模式）:
-        元数据日志（Metadata Topic） ← Raft 共识
-        /          |           \
-  Controller1  Controller2  Controller3 (奇数个，如 3)
-       \          |           /
-      Broker ← 从元数据日志同步
+Producer 实例
+├── RecordAccumulator（消息累加器，大小 = buffer.memory，默认 32MB）
+│   ├── TopicPartition-0 → Deque<ProducerBatch>  [batch1][batch2]
+│   ├── TopicPartition-1 → Deque<ProducerBatch>  [batch3]
+│   └── ...（每个分区一个双端队列）
+└── Sender 线程（后台）
+    → 从累加器取就绪批次 → 按 Broker 分组 → 组成 ClientRequest → 发送
 ```
 
-### 7.2 元数据日志（Metadata Log）
+### 10.2 关键参数
 
-**面试高频题：**
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `buffer.memory` | 32MB | 累加器总内存上限 |
+| `batch.size` | 16KB | 单个 ProducerBatch 的字节上限，攒满即发 |
+| `linger.ms` | 0 | 批次未满时，最多等待多久再发（攒批窗口） |
+| `max.block.ms` | 60000 | 缓冲区满时 `send()` 的最大阻塞时间，超时抛异常 |
+| `max.request.size` | 1MB | 单次请求最大字节数 |
 
-> Q: KRaft 模式中元数据日志是如何工作的？它和普通消息日志有什么区别？
+### 10.3 批次发送的触发时机
 
-A:
+一个批次在满足任一条件时被 Sender 发送：
+1. 批次大小达到 `batch.size`
+2. 距离批次创建经过了 `linger.ms`
+3. 有新批次要分配但 `buffer.memory` 不足，触发刷出
+4. 调用了 `flush()` 或 `close()`
 
-KRaft 引入**元数据日志（Metadata Log）**，替代 ZK 存储所有元数据。Controller 通过 Raft 共识将元数据变更写入元数据日志，其他节点（Controller Observer 和 Broker）从日志中复制。
+**【面试】`linger.ms` 和 `batch.size` 如何权衡？增大它们一定提高吞吐吗？**
 
-**元数据日志内容类型（`RecordType`）：**
+二者共同决定批次填充度与发送延迟：
 
-- `REGISTER_BROKER`：Broker 注册信息
-- `TOPIC_RECORD`：Topic 创建/配置/删除
-- `PARTITION_RECORD`：Partition 分配
-- `ISR_CHANGE_RECORD`：ISR 变更
-- `CONTROLLER_EPOCH`：Controller 任期记录
-- `CONFIG_RECORD`：动态配置变更
-
-**与普通消息日志的区别：**
-
-| 特性 | 普通消息日志 | 元数据日志 |
-|------|-------------|-----------|
-| 存储位置 | 本地磁盘（data dir） | 本地磁盘（metadata dir） |
-| 共识协议 | 异步复制（ISR） | Raft 同步复制 |
-| 清理策略 | DELETE / COMPACT | COMPACT（仅保留最新状态） |
-| 写入方式 | Leader 写入 | Active Controller 写入 |
-| 消费者 | 普通 Consumer | 内部 Follower/Observer 同步 |
-
-### 7.3 KRaft 选举
-
-**面试高频题：**
-
-> Q: KRaft 模式下的 Controller 选举和 ZK 模式有何不同？
-
-A:
-
-KRaft 使用基于 **Raft 协议** 的选举，不再是 ZK 的临时节点竞争：
-
-1. **Voter 节点**：配置在 `process.roles=controller` 的节点（需奇数个，如 1、3、5）
-2. **选举触发**：Active Controller（Leader）心跳超时
-3. **选举过程**：
-   - Candidate 发起 VoteRequest，携带 `term`（任期号）
-   - 多数派（Quorum，如 3 节点集群需 2 票）同意后成为 Leader
-4. **Leader 任期**：每个 term 对应一个 epoch，保证唯一性
-5. **Observer**：`process.roles=broker` 或 `process.roles=broker,controller` 的节点只同步不参与投票
-
-**配置示例：**
-
-```properties
-# KRaft 模式最小配置
-process.roles=broker,controller
-node.id=1
-controller.quorum.voters=1@node1:9093,2@node2:9093,3@node3:9093
-
-# 独立 Controller 节点配置
-process.roles=controller
-node.id=1
-controller.quorum.voters=1@controller1:9093,2@controller2:9093,3@controller3:9093
-
-# 独立 Broker 节点配置
-process.roles=broker
-node.id=4
-controller.quorum.voters=1@controller1:9093,2@controller2:9093,3@controller3:9093
-```
-
-**生产最佳实践：**
-
-- KRaft 模式下**混合节点**（`process.roles=broker,controller`）适合小规模集群（≤ 3 节点）
-- 大规模集群推荐**分离节点**：3 或 5 个独立 Controller + N 个 Broker
-- Controller Quorum 大小公式：`n = 2f + 1`，容忍 f 个节点故障
-- 迁移路径：ZK → Migration（2.8+）→ KRaft（3.3+）→ ZK 移除（4.0+）
-- 迁移前使用 `kafka-metadata-quorum` 工具验证集群状态
-
----
-
-## 8. 性能调优
-
-### 8.1 OS 层面
-
-**Page Cache & Swappiness**
-
-```bash
-# 减少 swap 倾向，Kafka 大量使用 Page Cache
-# 建议 swappiness = 1（有 swap 但仅当内存几乎耗尽时使用）
-sysctl -w vm.swappiness=1
-
-# 调整脏页回写阈值，让脏页在 Page Cache 中停留更长时间
-# 触发回写的脏页比例（默认 20%）
-sysctl -w vm.dirty_background_ratio=5
-# 强制回写的脏页比例（默认 50%）
-sysctl -w vm.dirty_ratio=20
-```
-
-**文件系统与磁盘：**
-
-- **文件系统**：推荐 XFS（优于 ext4），IOPS 更高
-- **挂载参数**：`noatime,nodiratime` 减少元数据写入
-- **磁盘**：SSD 优先，避免 HDD 做 RAID5（奇偶校验开销大）
-- **内核参数**：`kernel.numa_balancing=0`（大数据场景禁用 NUMA balancing）
-
-**面试高频题：**
-
-> Q: Kafka 重度使用 Page Cache，这意味着什么？如何监控 Page Cache 使用情况？
-
-A:
-
-Kafka 的设计哲学是将数据**先写到 Page Cache** 而不是直接刷盘：
-- Producer 写入 → **Page Cache**（毫秒级返回） → 异步刷盘
-- Consumer 读取 → **Page Cache** 命中（直接读内存） → 零拷贝 发送
-
-这意味着：
-- Kafka 不依赖 JVM 堆，消息数据存放在 OS 管理的 Page Cache 中
-- JVM 堆主要存储：索引缓存、生产者批次、消费者元数据
-- **建议 JVM 堆 = 4~8GB**，其余系统内存给 Page Cache
-- 监控指标：`kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec` / `BytesOutPerSec`
-- Linux 命令：`sar -B` 查看 page fault，`free -h` 查看 cache
-
-### 8.2 JVM GC
-
-**生产推荐配置：**
-
-```bash
-# G1 GC 推荐（JDK 11+）
--XX:+UseG1GC
--XX:MaxGCPauseMillis=20
--XX:InitiatingHeapOccupancyPercent=35
--XX:G1HeapRegionSize=16M
--XX:+DisableExplicitGC
--XX:+ParallelRefProcEnabled
--XX:G1NewSizePercent=10
--XX:G1MaxNewSizePercent=30
-
-# 堆大小
--Xms6G
--Xmx6G
-
-# 元空间
--XX:MetaspaceSize=128M
--XX:MaxMetaspaceSize=256M
-```
-
-**面试高频题：**
-
-> Q: Kafka 为什么推荐使用 G1 并给出上述参数？为什么堆大小不建议超过 8GB？
-
-A:
-
-1. **G1 优于 CMS**：
-   - CMS 在 Full GC 时是串行单线程，大堆（>6G）下停顿过长
-   - G1 可预测停顿时间，通过 `MaxGCPauseMillis` 控制
-   - G1 能有效处理大堆（4~32G）
-
-2. **堆大小不超过 8GB 的原因**：
-   - Kafka 的消息数据存在 **Page Cache**，不在堆内
-   - 堆主要存：索引缓存、未刷盘批次、网络连接缓冲区
-   - 堆太大 → GC 停顿时间长 → Broker 响应超时 → 分区 Leader 迁移
-   - 经验值：**4~8GB** 足够 Kafka 元数据缓存，剩余系统内存给 Page Cache
-
-**GC 监控指标：**
-
-- `kafka.producer:type=producer-metrics,name=waiting-threads`（等待内存的线程）
-- `kafka.server:type=BrokerTopicMetrics,name=TotalTimeMs`（请求处理时间分布）
-- JVM 指标：G1 Young GC 频率 < 10次/秒，Full GC = 0
-
-### 8.3 网络与 IO 线程
-
-**参数配置建议：**
-
-```properties
-# 网络线程（Processor）
-num.network.threads=3              # CPU 核心数 / 2
-
-# IO 线程（处理请求）
-num.io.threads=8                   # CPU 核心数 * 2
-
-# 后台线程（日志清理等）
-background.threads=10
-
-# 网络连接相关
-queued.max.requests=500            # IO 线程排队上限
-socket.receive.buffer.bytes=102400
-socket.send.buffer.bytes=102400
-```
-
-**架构图：**
-
-```
-Acceptors → Processors (Network Threads) → Request Queue → IO Threads → Response Queue → Processors → 客户端
-                 ↓ TCP Accept                       ↓ 请求处理                     ↓ TCP Send
-            多个 Processor 轮询                   多个 IO Thread                异步发送响应
-```
-
-### 8.4 批次与压缩
-
-**核心参数与原理：**
-
-```properties
-# 生产者端
-batch.size=131072                  # 128KB，增大可提高吞吐
-linger.ms=10                       # 等待时长，增加批次填充度
-compression.type=snappy            # 网络带宽敏感用 gzip
-buffer.memory=67108864             # 64MB 缓冲区
-max.block.ms=1000                  # 缓冲区满后的阻塞时间
-
-# Broker 端
-compression.type=producer          # 沿用 Producer 压缩格式，避免重新压缩
-log.flush.interval.messages=Long.MaxValue  # 不因消息数触发刷盘
-log.flush.interval.ms=Long.MaxValue       # 不因时间间隔触发刷盘（交给 OS）
-```
-
-**面试高频题：**
-
-> Q: `linger.ms` 和 `batch.size` 如何权衡？增大它们一定提高吞吐吗？
-
-A:
-
-`batch.size` 和 `linger.ms` 共同决定 Batch 的填充度和发送延迟：
-
-| 策略 | 延迟 | 吞吐 | 适用场景 |
-|------|------|------|---------|
-| low latency（毫秒级） | 低 | 低 | 实时响应型 |
-| high throughput（秒级） | 高 | 高 | 大吞吐批量型 |
+| 策略 | linger.ms | 延迟 | 吞吐 | 适用 |
+|------|-----------|------|------|------|
+| 低延迟 | 0~5ms | 低 | 低 | 实时响应型 |
+| 高吞吐 | 10~100ms | 高 | 高 | 批量型 |
 
 权衡点：
-- `batch.size` 太大 → 排队时间增加，小消息场景浪费
-- `linger.ms` 太大 → 增加延迟，消息堆积在 Producer 端
+- `batch.size` 过大 → 小消息场景内存浪费、排队时间增加
+- `linger.ms` 过大 → 延迟上升，消息堆积在 Producer 端
 - 推荐初始值：`batch.size=64KB`，`linger.ms=5~10ms`
-- 如果 Producer 端 `waiting-threads` 不为 0，说明缓冲区满，需增大 `buffer.memory` 或优化下游
+- 若 Producer 端 `waiting-threads` 指标 > 0，说明缓冲区满，需增大 `buffer.memory` 或优化下游消费速度
+
+### 10.4 内存满时的行为
+
+```
+send() 被调用
+  → 累加器申请内存
+  → 若 buffer.memory 不足
+      → 阻塞，最多等 max.block.ms
+      → 期间 Sender 持续发送以腾出空间
+      → 仍超时 → 抛 TimeoutException
+```
+
+> 这是「背压（backpressure）」机制：当下游/网络跟不上时，生产端主动阻塞，避免内存溢出。
 
 ---
 
-## 9. 生产运维
+## 11. 生产者发送应答机制
 
-### 9.1 集群规划
+> 应答机制（acks）决定「消息算写成功」的标准，它直接依赖 Broker 端的**副本机制**。本节先讲 acks，再深入其背后的 ISR / HW / Leader Epoch。
 
-**节点规模估算公式：**
+### 11.1 acks 参数
+
+| 值 | 含义 | 可靠性 | 延迟 |
+|----|------|--------|------|
+| `acks=0` | 不等任何确认，发出即认为成功 | 最低（可能丢） | 最快 |
+| `acks=1`（旧默认） | Leader 写入本地即确认 | 中（Leader 宕机可能丢） | 较快 |
+| `acks=all`/`-1` | ISR 全部副本确认 | 最高 | 最慢 |
+
+> `acks=all` 必须搭配 `min.insync.replicas>=2` 才有意义：若 ISR 只剩 Leader 一个副本，`acks=all` 退化为 `acks=1`，Leader 宕机仍丢数据。
+
+### 11.2 副本机制：AR / ISR / OSR
+
+**【面试】解释 AR、ISR、OSR，以及 ISR 的判定标准。**
+
+- **AR（Assigned Replicas）**：分区的全部副本列表
+- **ISR（In-Sync Replicas）**：与 Leader 保持同步的副本集合（含 Leader 自身）
+- **OSR（Out-of-Sync Replicas）**：同步滞后的副本，`AR = ISR + OSR`
+
+ISR 判定标准（由 `replica.lag.time.max.ms` 控制，默认 30s）：
+- Follower 须在该时间内持续向 Leader 发起 **fetch 请求**并追上 Leader 的 LEO
+- 0.9+ 后**只按时间判断**，不再按落后消息条数（避免突发流量误判）
+- 超时未追上 → 踢出 ISR；重新追上 → 自动加回
+
+```scala
+// kafka.cluster.Partition#maybeShrinkIsr —— 找出不同步副本并收缩 ISR
+val outOfSyncReplicas = currentIsr.filter { replica =>
+  (time.milliseconds() - replica.lastFetchTimeMs) > configs.replicaLagTimeMaxMs
+}
+if (outOfSyncReplicas.nonEmpty) updateIsr(currentIsr -- outOfSyncReplicas)
+```
+
+### 11.3 HW 与 LEO
+
+**【面试】HW、LEO 是什么？Consumer 能读到 HW 还是 LEO 以内的数据？**
+
+- **LEO（Log End Offset）**：当前副本最后一条消息的下一个位置
+- **HW（High Watermark）**：所有 ISR 副本都已同步到的 offset，**Consumer 只能读到 HW 之前的数据**
 
 ```
-所需 Broker 数 = max(
-    总吞吐 / 单机吞吐,
-    (总存储 × 副本因子) / 单机存储,
-    (总 Partition 数) / (单机建议 Partition 数上限)
-)
-
-单机吞吐 = min(磁盘顺序写吞吐, 网络带宽, CPU 压缩解压能力)
+                Leader          Follower1      Follower2
+LEO:            10              8              5
+HW = min(所有 ISR 副本的 LEO) = min(10, 8, 5) = 5
+Consumer 可见范围：offset < 5
 ```
 
-**硬件配置推荐：**
+HW 更新流程：
+1. Producer 写入 Leader → Leader 的 LEO 增加，HW 暂不变
+2. Follower 发 FetchRequest 拉取 → 写本地日志 → 更新自身 LEO
+3. Leader 收到 ISR 内所有 Follower 的 fetch 进度后，HW = min(所有 ISR 副本 LEO)
+4. 后续 fetch 响应携带新 HW，Follower 据此更新自身 HW
 
-| 组件 | 小规模（< 100MB/s） | 中规模（100~500MB/s） | 大规模（> 500MB/s） |
-|------|-------------------|---------------------|-------------------|
-| CPU | 8 核 | 16 核 | 32 核+ |
-| 内存 | 16GB | 32GB | 64GB+（建议 128GB） |
-| 磁盘 | 4×2TB HDD | 4×4TB SSD | 8×8TB NVMe |
-| 网络 | 10Gbps | 25Gbps | 100Gbps |
-| 部署模式 | 3 节点 | 6 节点 | 12 节点+ |
+### 11.4 Leader Epoch
 
-**操作系统参数汇总：**
+**【面试】Leader Epoch（0.11 引入）解决了什么问题？**
+
+解决纯 HW 截断机制导致的**数据丢失**与**数据不一致**：
+
+```
+问题场景：
+Step1: Leader LEO=12，Follower 落后，HW=5
+Step2: Leader 宕机，Follower 成为新 Leader，HW=5
+Step3: 原 Leader 恢复，按旧 HW=5 截断日志 → offset 5~11 的数据丢失！
+```
+
+Leader Epoch 方案：每个 Leader 任期记录 `<epoch, startOffset>`。副本重启后先发 `LeaderEpochRequest` 询问新 Leader 该 epoch 的起始偏移量，据此精确截断，而非盲目按 HW 截断。
+
+```scala
+// kafka.server.epoch.LeaderEpochFileCache —— 存于 leader-epoch-checkpoint
+// 如 [(0,0),(1,100),(2,200)]：epoch 1 从 offset 100 开始
+def assign(epoch: Int, startOffset: Long): Unit
+def endOffsetFor(epoch: Int): Option[Long]
+```
+
+### 11.5 Unclean Leader Election（不完全 Leader 选举）
+
+**【面试】`unclean.leader.election.enable` 设 true / false 的影响？**
+
+| 配置 | 行为 | 一致性 | 可用性 |
+|------|------|--------|--------|
+| `false`（推荐） | 只允许 ISR 副本当 Leader | 强一致 | 较低（ISR 全下线则分区不可用） |
+| `true` | 允许 OSR 副本当 Leader | 弱一致（可能丢数据） | 较高 |
+
+- **金融/核心业务**：`false`，宁可不可用也不丢数据
+- **日志/可观测**：`true`，可用性优先
+- 配合 `min.insync.replicas=2`、`replication.factor=3` 形成典型可靠配置
+
+### 11.6 Producer 端如何保证不丢消息（完整链路）
+
+**【面试】消息不丢失需要从哪几个维度保证？**
+
+从 Producer、Broker、Consumer 三个维度，缺一不可：
+
+```
+Producer 侧：acks=all + enable.idempotence=true
+           + retries=Integer.MAX_VALUE + 回调处理失败（不要 fire-and-forget）
+Broker 侧：  replication.factor>=3 + min.insync.replicas>=2
+           + unclean.leader.election.enable=false
+Consumer 侧：enable.auto.commit=false + 先处理再提交 + 业务幂等兜底
+```
+
+易忽略的细节：
+- `acks=all` 但 `min.insync.replicas=1` 时，ISR 只剩 Leader，宕机仍丢
+- 日志保留策略（`retention.ms`/`retention.bytes`）到期后，即使未消费也会删除
+
+---
+
+## 12. 生产者消息幂等性
+
+### 12.1 开启方式与原理
+
+开启：`enable.idempotence=true`（Kafka 3.0+ **默认开启**）。
+
+```go
+// 幂等 Producer 请求协议字段（对应 Kafka ProducerRequest）
+type ProducerRequest struct {
+    ProducerID     int64   // 服务端分配的 PID（首次请求返回）
+    ProducerEpoch  int16   // Producer 初始化递增，用于 fencing 旧 Producer
+    SequenceNumber int32   // 按 <PID, Partition> 单调递增，从 0 开始
+    Data           []RecordBatch
+}
+```
+
+Broker 端按 `<PID, Partition, SequenceNumber>` 三元组去重：
+- `seq == expectedSeq + 1` → 接受
+- `seq <= expectedSeq` → 丢弃（重复，由网络重试导致）
+- `seq > expectedSeq + 1` → 拒绝（说明中间有消息丢失，乱序）
+
+### 12.2 局限性
+
+**【面试】幂等 Producer 的局限性是什么？**
+
+1. **只保证单 Partition 内 Exactly Once**：跨 Partition 需事务 API
+2. **只保证 Producer → Broker 间不重复**：Consumer 端仍可能重复投递
+3. **只在单 Session 内有效**：Producer 重启后 PID 变化，无法对旧 PID 的消息去重
+4. 因此「端到端 Exactly Once」需要 **幂等 + 事务 + 消费端 read_committed** 三者配合
+
+### 12.3 幂等 vs 事务
+
+| 特性 | 幂等 Producer | 事务 Producer |
+|------|---------------|---------------|
+| 保障级别 | 单会话单分区不丢不重 | 跨分区、跨会话原子性 |
+| 跨分区原子性 | 不支持 | 支持 |
+| 跨会话幂等 | 不支持 | 支持 |
+| 性能开销 | 几乎无 | 吞吐下降 10%~50% |
+| 配置 | `enable.idempotence=true` | 额外配 `transactional.id` |
+
+---
+
+## 13. 消息压缩机制与消息事务
+
+### 13.1 压缩算法对比
+
+| 算法 | 压缩比 | CPU 开销 | 速度 | 适用场景 |
+|------|--------|---------|------|---------|
+| none | 无 | 无 | — | 不推荐 |
+| gzip | 高 | 高 | 慢 | 带宽受限、追求高压缩比 |
+| snappy | 中 | 低 | 快 | 吞吐优先 |
+| lz4 | 中 | 低 | 快 | **吞吐优先，常用推荐** |
+| zstd | 最高 | 中 | 中快 | 追求极致压缩比（2.1+） |
+
+### 13.2 压缩配置与原理
+
+```properties
+# Producer 端压缩（推荐，在客户端就压缩，节省网络）
+compression.type=lz4
+
+# Broker 端：沿用 Producer 压缩格式，避免重新压缩
+compression.type=producer
+```
+
+要点：
+- 压缩在**批次级别**进行，批次越大压缩比越高（压缩 + 攒批效果叠加）
+- 若 Broker 的 `compression.type` 与 Producer 不同，Broker 会**解压再重新压缩**，增加 CPU 开销
+- 压缩对零拷贝**无影响**：消息以压缩态存储和传输，由 Consumer 解压
+
+### 13.3 事务消息
+
+**配置：**
+
+```properties
+# Producer
+transactional.id=order-tx-1      # 唯一事务标识（跨会话幂等的关键）
+enable.idempotence=true          # 事务必须开启幂等
+transaction.timeout.ms=60000
+
+# Consumer
+isolation.level=read_committed   # 只消费已提交事务的消息
+```
+
+**事务 API 流程：**
+
+```java
+producer.initTransactions();
+try {
+    producer.beginTransaction();
+    producer.send(new ProducerRecord<>("topic-a", key, value));
+    producer.send(new ProducerRecord<>("topic-b", key, value));
+    // 消费-处理-生产场景：把消费位移也纳入事务
+    producer.sendOffsetsToTransaction(offsets, consumerGroupMetadata);
+    producer.commitTransaction();
+} catch (Exception e) {
+    producer.abortTransaction();
+}
+```
+
+**事务状态流转：**
+
+```
+EMPTY → ONGOING → COMMITTING → COMMITTED
+              └→ ABORTING  → ABORTED
+```
+
+- 由**事务协调器（Transaction Coordinator）** 管理，状态存于内部 Topic `__transaction_state`（默认 50 分区）
+- 两阶段提交：写消息（标记未提交）→ 写 COMMIT/ABORT Marker
+
+### 13.4 Exactly-Once 与 read_committed
+
+**【面试】Exactly Once 如何实现？read_committed 的原理？**
+
+端到端 EOS = 幂等 Producer + 事务 + 消费端 `read_committed`：
+
+```
+生产者：enable.idempotence=true + transactional.id
+Broker：acks=all + replication.factor>=3 + min.insync.replicas>=2
+消费者：isolation.level=read_committed + 手动提交 + sendOffsetsToTransaction()
+```
+
+`read_committed` 原理：
+- Broker 维护 **LSO（Log Stable Offset）** = 第一条未提交事务消息的 offset
+- `read_committed` 消费者只能读到 LSO 之前的消息
+- 通过 `.txnindex` 文件过滤已回滚（ABORT）的消息
+
+**【面试】卡住的事务（长时间未提交）有什么影响？如何解决？**
+
+- 长时间未提交的事务会使 LSO 停滞，`read_committed` 消费者被阻塞
+- `transaction.timeout.ms`（默认 60s）超时后，Coordinator 自动 abort 该事务
+- 建议：设置合理超时（如 ≤ 120s）、监控未完成事务数量
+- 高吞吐场景优先考虑**下游幂等**而非事务（EOS 带来 10%~50% 吞吐下降）；EOS v2（2.5+）可减少协调器交互，性能提升约 30%
+
+---
+
+# 附录 A · 服务端原理与生产运维（待对齐视频后续目录）
+
+> 以下内容属于服务端深度原理与生产运维，对应视频在 kfk2-9 之后的章节（你贴出的目录尚未覆盖到这里）。先按主题归档保留，待补全后续目录后再对齐章节编号。源码级更深入的剖析见 [`deep-dive/kafka-internals-deep-dive.md`](./deep-dive/kafka-internals-deep-dive.md)。
+
+## A.1 存储原理
+
+### 日志存储（Log Segment）
+
+```
+/topics/order-events-0/
+├── 00000000000000000000.log       # 消息数据
+├── 00000000000000000000.index     # 偏移量索引（稀疏）
+├── 00000000000000000000.timeindex # 时间戳索引
+└── 00000000000000000059.snapshot  # 生产者状态快照
+```
+
+- LogSegment 是存储的最小物理单元，默认 1GB（`log.segment.bytes`）
+- 活跃 Segment 可写，历史 Segment 只读
+- Segment 命名以其首条消息的偏移量为基准（20 位补零）
+
+**【面试】Kafka 为什么快？**
+
+1. **顺序 I/O**：追加写，顺序写约 600MB/s vs 随机写约 100KB/s（差约 6000 倍）
+2. **Page Cache**：写先落 OS Page Cache 异步刷盘，读优先命中 Page Cache
+3. **零拷贝**：消费读取走 `sendfile`，数据从 Page Cache 直达网卡
+4. **批量 + 压缩**：Producer 批量发、Broker 批量写、Consumer 批量拉
+5. **稀疏索引**：索引文件小，可常驻内存
+
+### 索引文件
+
+- **偏移量索引（.index）**：稀疏索引，每写 `log.index.interval.bytes`（默认 4KB）记一条 `<相对偏移, 物理位置>`。查找：二分索引 → 物理位置范围 → 顺序扫描 .log
+- **时间戳索引（.timeindex）**：`<时间戳, 相对偏移>`，用于按时间查找消息
+
+> 索引损坏可由 .log 重建（.log 含完整数据，索引仅加速）。索引文件用 **mmap** 做随机读写。
+
+### 零拷贝（sendfile）
+
+```
+传统路径：磁盘→内核缓冲→用户缓冲→Socket缓冲→网卡（4 次拷贝 + 4 次上下文切换）
+零拷贝：  磁盘→PageCache→网卡（2 次 DMA 拷贝 + 0 次 CPU 拷贝 + 2 次上下文切换）
+```
+
+- `sendfile`（`FileChannel.transferTo`）用于 Consumer 读取
+- 索引文件用 `mmap`（适合小文件随机读写，sendfile 适合大文件传输）
+
+### 日志清理与压缩
+
+| 策略 | `log.cleanup.policy` | 行为 |
+|------|---------------------|------|
+| 删除 | `delete` | 按时间/大小删除老 Segment |
+| 压缩 | `compact` | 每个 Key 只保留最新值 |
+
+```
+压缩前：k1=A, k2=B, k1=C, k3=D
+压缩后：k2=B, k1=C, k3=D（offset 不连续）
+```
+
+- Cleaner 线程独立执行，`min.cleanable.dirty.ratio=0.5` 触发
+- 适用 KV 语义数据（用户配置、`__consumer_offsets`）；普通业务 Topic 用 `delete`
+
+## A.2 Controller 与协调器
+
+**【面试】Controller 的职责？如何选举？宕机如何恢复？**
+
+职责：管理分区 Leader 选举、监听 Broker 上下线、管理元数据变更并同步到所有 Broker。
+
+ZK 模式选举：
+```
+1. 所有 Broker 抢占创建 ZK 临时节点 /controller
+2. 第一个成功者成为 Controller
+3. 其余 Broker 注册 Watcher 监听 /controller
+4. Controller 宕机 → 临时节点消失 → Watcher 触发 → 重新竞选
+```
+
+- 唯一性靠 ZK 临时节点 + 递增 `controller_epoch` 保证
+- 僵尸 Controller 的请求因 epoch 较低被拒绝
+
+## A.3 KRaft 模式
+
+**演进：** 2.8 预览 → 3.3 生产可用 → 4.0 移除 ZK。
+
+```
+KRaft 架构：
+  元数据日志（Metadata Topic）← Raft 共识
+  Controller1  Controller2  Controller3（奇数个 Voter）
+  Broker ← 从元数据日志同步（Observer）
+```
+
+**【面试】KRaft 相比 ZK 的优势？**
+
+1. 架构简化：无需维护 Kafka + ZK 两套系统
+2. 故障检测更快：ZK session 秒级 → Raft 心跳百毫秒级
+3. 元数据同步更快：直接基于 Raft Log，无 ZK 序列化开销
+4. 支持更大规模：测试验证 200 万分区
+5. 选举机制：ZK 临时节点 + Watcher → Raft 多数派共识（避免脑裂）
+
+```properties
+# KRaft 最小配置
+process.roles=broker,controller
+node.id=1
+controller.quorum.voters=1@n1:9093,2@n2:9093,3@n3:9093
+```
+
+Controller Quorum 遵循 `n = 2f + 1`，容忍 f 个节点故障。
+
+## A.4 性能调优
+
+### OS 层
 
 ```bash
-# /etc/sysctl.conf
-vm.swappiness=1
-vm.dirty_background_ratio=5
-vm.dirty_ratio=20
-net.core.somaxconn=2048
-net.ipv4.tcp_max_syn_backlog=2048
-fs.file-max=10000000
+vm.swappiness=1               # Kafka 重度依赖 Page Cache，尽量不 swap
+vm.dirty_background_ratio=5   # 脏页后台回写阈值
+vm.dirty_ratio=20             # 脏页强制回写阈值
 ```
 
-### 9.2 监控指标
+- 文件系统推荐 XFS，挂载 `noatime`；优先 SSD/NVMe
+- Kafka 消息数据在 Page Cache，**JVM 堆建议 4~8GB**，其余内存留给 Page Cache
 
-**必监控的三类指标：**
+### JVM GC
 
-**1. 吞吐与延迟：**
+```bash
+-XX:+UseG1GC -XX:MaxGCPauseMillis=20
+-XX:InitiatingHeapOccupancyPercent=35
+-Xms6G -Xmx6G            # 堆不超 8GB，否则 GC 停顿长导致 Broker 被踢
+```
 
-| 指标名 | JMX MBean | 告警阈值 |
-|--------|-----------|---------|
-| BytesInPerSec | `kafka.server:type=BrokerTopicMetrics,name=BytesInPerSec` | 周期性对比 |
-| BytesOutPerSec | `kafka.server:type=BrokerTopicMetrics,name=BytesOutPerSec` | 周期性对比 |
-| TotalTimeMs | `kafka.server:type=BrokerTopicMetrics,name=TotalTimeMs` | p99 > 500ms |
-| RequestQueueSize | `kafka.server:type=RequestMetrics,name=RequestQueueSize` | > 500 |
+**【面试】堆为什么不建议超过 8GB？**
+消息数据在 Page Cache 不在堆内；堆太大 → GC 停顿长 → Broker 响应超时 → 分区 Leader 迁移。
 
-**2. 消费者健康：**
+### 网络与 IO 线程
 
-| 指标名 | JMX MBean | 告警阈值 |
-|--------|-----------|---------|
-| ConsumerLag | `kafka.consumer:type=consumer-fetch-manager-metrics,client-id=*,name=records-lag-max` | > 阈值 |
-| RebalanceRate | `kafka.consumer:type=consumer-coordinator-metrics,name=rebalance-rate-per-hour` | > 10/h |
+```properties
+num.network.threads=3    # ≈ CPU 核数 / 2
+num.io.threads=8         # ≈ CPU 核数 * 2
+num.replica.fetchers=2
+queued.max.requests=500
+```
 
-**3. 服务端健康：**
+## A.5 生产运维
 
-| 指标名 | JMX MBean | 告警阈值 |
-|--------|-----------|---------|
-| UnderReplicatedPartitions | `kafka.server:type=ReplicaManager,name=UnderReplicatedPartitions` | > 0 |
-| OfflinePartitions | `kafka.controller:type=KafkaController,name=OfflinePartitionsCount` | > 0 |
-| ISRShrinkRate | `kafka.server:type=ReplicaManager,name=ISRShrinkRate` | > 异常 |
-| ActiveControllerCount | `kafka.controller:type=KafkaController,name=ActiveControllerCount` | != 1 |
+### 监控核心指标
 
-**面试高频题：**
+| 类别 | 指标 | 告警阈值 |
+|------|------|---------|
+| 服务端 | `UnderReplicatedPartitions` | > 0 |
+| 服务端 | `OfflinePartitionsCount` | > 0 |
+| 服务端 | `ActiveControllerCount` | != 1 |
+| 服务端 | `ISRShrinkRate` | 异常升高 |
+| 消费者 | `records-lag-max`（Consumer Lag） | 超业务阈值 |
+| 消费者 | `rebalance-rate-per-hour` | > 10/h |
+| 吞吐 | `BytesInPerSec` / `BytesOutPerSec` | 周期对比 |
 
-> Q: Consumer Lag 滞后通常是哪些原因导致的？排查思路是什么？
-
-A:
-
-**原因排查树：**
+**【面试】Consumer Lag 上升如何排查？**
 
 ```
 Consumer Lag 上升
-├── 消费者处理能力不足
-│   ├── 单条消息处理耗时过长 (检查 max.poll.interval.ms)
-│   ├── Consumer 线程数不足 (检查 num.stream.threads)
-│   └── 下游（DB/API）阻塞
-├── 生产者流量突增
-│   ├── 排查上游流量来源
-│   └── 检查是否需要扩容 Partition + Consumer
-├── Rebalance 频繁
-│   ├── session.timeout.ms 过小
-│   ├── Consumer 处理超时
-│   └── 网络抖动
-└── Broker 端瓶颈
-    ├── 磁盘 I/O Wait 高（Page Cache 不足或磁盘故障）
-    ├── 网络带宽打满
-    └── 分区 Leader 分布不均
+├── 消费能力不足（单条耗时长 / 线程不足 / 下游 DB/API 阻塞）
+├── 生产流量突增（排查上游 / 扩容分区 + 消费者）
+├── Rebalance 频繁（session.timeout 过小 / 处理超时 / 网络抖动）
+└── Broker 瓶颈（磁盘 IO Wait / 网络打满 / Leader 分布不均）
 ```
 
-### 9.3 分区重分配
+解决：扩容消费者（≤ 分区数，不足先加分区）、增大 `max.poll.records`/`fetch.max.bytes`、异步处理、优化业务逻辑。
 
-**触发场景：**
-
-1. 集群扩容或缩容
-2. 磁盘利用率不均衡
-3. Broker 下线维护
-
-**命令：**
+### 分区重分配
 
 ```bash
-# 生成重分配计划
-kafka-reassign-partitions.sh \
-  --bootstrap-server localhost:9092 \
-  --generate \
-  --topics-to-move-json-file topics.json \
-  --broker-list "1,2,3,4,5"
-
-# 执行重分配
-kafka-reassign-partitions.sh \
-  --bootstrap-server localhost:9092 \
-  --execute \
-  --reassignment-json-file reassign.json
-
-# 验证进度
-kafka-reassign-partitions.sh \
-  --bootstrap-server localhost:9092 \
-  --verify \
-  --reassignment-json-file reassign.json
+# 生成 → 执行（限流 50MB/s）→ 验证
+kafka-reassign-partitions.sh --execute \
+  --reassignment-json-file reassign.json \
+  --throttle 50000000 --bootstrap-server localhost:9092
 ```
 
-**面试高频题：**
+本质是数据搬迁：新副本同步 → 追上 HW 加入 ISR → 切 Leader → 删旧副本。建议低峰执行并监控 `UnderReplicatedPartitions`。
 
-> Q: 分区重分配过程中会影响生产消费吗？如何减少影响？
-
-A:
-
-分区重分配的本质是**数据搬迁**，过程如下：
-
-1. 新 Leader 开始从旧 Leader 同步数据（增量复制）
-2. 当新副本赶上 HW 后，加入 ISR
-3. 切换 Leader 到目标 Broker
-4. 删除旧的副本数据
-
-影响控制：
-- 数据同步期间网络 IO 增加，可能影响正常请求
-- 可通过 `--throttle` 限制带宽：`kafka-reassign-partitions.sh --execute --throttle 50000000`（约 50MB/s）
-- 建议在**业务低峰期**执行
-- 监控 `UnderReplicatedPartitions` 确保重分配完成后恢复正常
-
-### 9.4 数据保留策略
-
-**参数：**
+### 数据保留
 
 ```properties
-# 基于时间的保留（默认 7 天）
-log.retention.hours=168
-
-# 基于大小的保留（默认无限制）
-log.retention.bytes=-1
-
-# Segment 文件大小（默认 1GB）
-log.segment.bytes=1073741824
-
-# Segment 删除前检查时间间隔
-log.retention.check.interval.ms=300000
+log.retention.hours=168      # 7 天
+log.retention.bytes=-1       # 大小上限（默认无限）
+log.segment.bytes=1073741824 # 1GB
 ```
 
-**删除机制：**
+LogManager 每 5 分钟检查：删过期 Segment、删超限 Segment。建议时间 + 大小双策略。
 
-```
-日志删除管理器（LogManager）每 5 分钟执行一次：
-1. 计算每个 Log 的可删除 Segment 列表
-2. 删除过期 Segment（超过 retention.hours）
-3. 删除超限 Segment（所有 Segment 总和超过 retention.bytes）
-4. 如果都不是，检查 Log Start Offset 之前的部分
-```
+### 滚动升级要点
 
-**生产最佳实践：**
+1. 关闭自动 Leader 均衡 → 逐台关停 Broker 等待 Leader 切换 → 升级重启 → 确认 ISR 恢复 → 重复
+2. 先升级 Broker 再升级客户端；确认 RPC 协议兼容，跨大版本需逐版本升级
+3. 准备回滚方案；KRaft 模式注意元数据版本兼容
 
-- **日志类场景**：保留时间较短（如 3~7 天），用 `log.retention.hours` 控制
-- **事件溯源场景**：使用**日志压缩**（`log.cleanup.policy=compact`）
-- **关键审计数据**：保留时间设置较长（如 30~90 天），需做好容量规划
-- 不要单纯依赖时间策略，搭配 `log.retention.bytes` 做硬性上限
+### 常见故障速查
 
-### 9.5 MirrorMaker 跨集群复制
+| 现象 | 排查方向 |
+|------|---------|
+| Producer 发送超时 | Broker 是否在线、RequestQueue 是否堆积、IO 线程不足 |
+| 消费者组卡住 | 是否频繁 Rebalance、`max.poll.records × 处理耗时` 是否超时 |
+| 磁盘写满 | 调小 retention 立即触发清理、扩容 + 重分配 |
+| Leader 频繁切换 | 网络延迟/丢包、GC 停顿、副本同步被 IO Wait 阻塞 |
 
-**工具演进：**
+## A.6 与其他 MQ 选型对比
 
-| 版本 | 工具 | 特点 |
-|------|------|------|
-| 2.x | MirrorMaker 1 | 简单的 Consumer → Producer 管道 |
-| 2.5+ | MirrorMaker 2 | 基于 Kafka Connect，支持双向同步、偏移量翻译、Topic 重命名 |
-| 3.0+ | MirrorMaker 2 | 生产推荐（已移除 MM1） |
-
-**MirrorMaker 2 配置示例：**
-
-```properties
-# mm2.properties
-clusters=source, target
-source.bootstrap.servers=source-cluster:9092
-target.bootstrap.servers=target-cluster:9092
-
-source->target.enabled=true
-target->source.enabled=false  # 单向复制
-
-# Topic 自动创建
-target.auto.create.internal.topics=true
-
-# 重命名规则
-target->target.topic.patterns=.*
-target->target.topic.rename.pattern=(.*)
-target->target.topic.rename.replace.with=dr-$1
-
-# 偏移量同步
-sync.topic.acls.enabled=true
-sync.topic.configs.enabled=true
-replication.factor=3
-
-# 消费者配置
-source.consumer.group.id=mm2-source-consumer
-source.consumer.max.poll.records=5000
-```
-
-**面试高频题：**
-
-> Q: MirrorMaker 2 如何保证跨集群的偏移量一致性？
-
-A:
-
-MirrorMaker 2 创建内部 Topic：`mm2-offsets.<source-cluster>.<target-cluster>`，存储源集群每个 Consumer Group 的偏移量映射，使得在灾备切换时目标集群可以从正确位置继续消费。
-
-```
-源集群状态：
-consumer-group A / topic T / partition 0 → offset 1000
-
-转换成目标集群：
-topic dr-T / partition 0 → offset 980（经过同步转换）
-
-MirrorMaker 2 自动将偏移量写入目标集群的 __consumer_offsets，
-使用相同的 Consumer Group ID，实现无缝切换。
-```
-
-### 9.6 常见故障排查
-
-**场景 1：Producer 发送超时**
-
-```
-错误: `Failed to update metadata after 60000 ms.`
-排查:
-1. 检查 Broker 是否在线（telnet broker:9092）
-2. 检查 metadata.max.age.ms 是否设置过小
-3. 检查 Broker 端 RequestQueue 是否堆积（IO 线程不够）
-```
-
-**场景 2：消费者组卡住**
-
-```
-症状: Consumer Lag 持续增长
-排查:
-1. Consumer 日志是否出现多次 Rebalance
-2. 检查 max.poll.records 与单条处理时间的乘积是否大于 max.poll.interval.ms
-3. 检查 session.timeout.ms 是否过小（网络抖动导致踢出组）
-```
-
-**场景 3：磁盘写满**
-
-```
-紧急处理:
-1. 调整 log.retention.hours 或 log.retention.bytes 立即触发清理
-2. 手动删除旧 Segment（需先停止 Kafka，极危险，仅当紧急）
-3. 扩容新磁盘并执行分区重分配
-```
-
-**场景 4：Leader 频繁切换**
-
-```
-症状: UnderReplicatedPartitions > 0，大量 ISR 抖动
-排查:
-1. 检查网络延迟和丢包（ping, traceroute）
-2. 检查 GC 停顿是否过长（G1 GC日志）
-3. 检查副本同步线程是否被 IO Wait 阻塞
-4. 检查 broker 间最大 fetch 大小是否不匹配
-```
-
----
-
-## 10. 与 RabbitMQ 场景对比
-
-### 10.1 架构与模型对比
+### Kafka vs RabbitMQ
 
 | 维度 | Kafka | RabbitMQ |
 |------|-------|----------|
-| 定位 | 分布式流平台 | 消息中间件（AMQP 0-9-1） |
-| 消息模型 | Topic / Partition / Offset | Exchange / Queue / Routing Key |
-| 存储 | 持久化日志 Log Segment | 内存 / 普通文件 |
-| 消费模型 | Pull（消费者拉取） | Push / Pull 兼有 |
-| 路由 | 分区 Key + 分区策略 | Exchange Type（direct/fanout/topic/headers） |
-| 顺序保证 | 单 Partition 内有序 | 单 Queue 内有序 |
-| 消息过滤 | Broker 端不支持 | Broker 端支持（Header/Routing Key） |
-| 延迟消息 | 不原生支持 | 支持（插件或 TTL+DLQ） |
+| 定位 | 分布式流平台 | 消息代理（AMQP） |
+| 模型 | Topic/Partition/Offset | Exchange/Queue/RoutingKey |
+| 消费 | Pull | Push/Pull |
+| 顺序 | 单 Partition 内有序 | 单 Queue 内有序 |
+| 延迟消息 | 不原生支持 | 原生支持（插件/TTL+DLQ） |
+| 吞吐 | 百万条/秒 | 万~十万条/秒 |
+| 延迟 | 毫秒级 | 微秒级 |
+| 长期保留/回溯 | 强 | 弱（投递完即删） |
 
-### 10.2 功能与特性对比
+### Kafka vs RocketMQ vs Pulsar
 
-| 特性 | Kafka | RabbitMQ |
-|------|-------|----------|
-| 重试机制 | 需自行实现（DLT）+ 重试 Topic | 原生死信 + 重新入队 |
-| 死信队列 | DLT（需要手动配置） | DLX（原生支持） |
-| 消息 TTL | 按 Topic 级别设置 | 按消息/Queue 级别设置 |
-| 优先级 | 不原生支持 | 原生支持 |
-| 延迟队列 | 不原生支持（需 Kafka Streams） | 原生支持（延迟插件） |
-| 事务 | 生产者事务 + Exactly Once | AMQP 事务（性能差） |
-| 大规模分区 | 万级 | 不明显（单节点瓶颈） |
+| 维度 | Kafka | RocketMQ | Pulsar |
+|------|-------|----------|--------|
+| 架构 | 计算存储耦合 | NameServer + 主从 | **计算存储分离** |
+| 吞吐 | **百万级 TPS** | 十万~百万 | 十万~百万 |
+| 延迟 | 毫秒级 | **最低 <3ms** | P99 较高 |
+| 最大 Topic 数 | 数万 | 数万 | **百万级** |
+| 延迟/定时消息 | 不支持 | **原生（任意精度）** | 原生 |
+| 事务消息 | 支持 | **原生成熟（2PC）** | 原生 |
+| 多租户 | 弱 | 命名空间 | **原生强隔离** |
+| 云原生 | 中 | 中 | **最佳** |
 
-### 10.3 性能对比
+**选型建议：**
+- 大数据/日志/流处理/高吞吐 → **Kafka**
+- 电商金融/事务顺序/高可靠 → **RocketMQ**
+- 云原生/多租户/跨地域 → **Pulsar**
+- 灵活路由/延迟消息/逐条确认/低运维 → **RabbitMQ**
 
-| 场景 | Kafka | RabbitMQ |
-|------|-------|----------|
-| 吞吐量 | **百万条/秒**（顺序 I/O + 零拷贝） | 万~十万条/秒 |
-| 延迟 | 毫秒级（大规模批量下几毫秒），但微秒级要求达不到 | **微秒级**（Erlang 天生低延迟） |
-| 持久化 | 高（日志追加，顺序 I/O） | 中（随机 I/O） |
-| 高可用 | 复制因子 + ISR + 区域部署 | 镜像队列 / 仲裁队列 + 自动同步 |
+## A.7 Kafka Streams 与 ksqlDB
 
-### 10.4 选型决策树
+| 抽象 | 说明 |
+|------|------|
+| KStream | 不可变、仅追加的事件流 |
+| KTable | 可变键值表（由 Compacted Topic 支持） |
+| GlobalKTable | 全局复制表，用于维表关联 |
+| State Store | 本地状态存储（RocksDB），由 Changelog Topic 容错 |
 
-```
-业务场景
-├── 高吞吐日志收集、埋点数据、Metrics、审计日志
-│   → Apache Kafka
-├── 事件流处理、Stream、数据管道（CDC、ETL）
-│   → Apache Kafka + Kafka Streams / ksqlDB
-├── 金融交易、订单状态变更，需要 Exactly Once
-│   → Apache Kafka（事务 API）
-├── 任务调度、异步解耦、需要灵活的投递策略
-│   → RabbitMQ（直连/主题/广播+死信）
-├── 延迟消息、定时任务
-│   → RabbitMQ
-├── RPC 风格的消息通信、需要消息确认等复杂交互
-│   → RabbitMQ
-└── "我不知道未来需求是什么"
-    → 场景复杂选 Kafka（扩展性好），简单直连选 RabbitMQ（运维成本低）
-```
+**流表二象性（Stream-Table Duality）：** Stream 经聚合（取每个 Key 最新值）变 Table；Table 经变更日志（changelog）变 Stream。同一 Topic 既可读作 Stream 也可读作 Table。
 
-**面试高频题：**
+**窗口类型：** Tumbling（固定不重叠）、Hopping（固定可重叠）、Session（活动间隔）、Sliding（流-流 Join）。
 
-> Q: 在微服务架构中，Kafka 和 RabbitMQ 各适合什么场景？为什么不能互相替代？
-
-A:
-
-**必须用 RabbitMQ 的场景：**
-- 需要**灵活路由**（Header Exchange、Topic Exchange 多级通配符）
-- 需要**延迟/定时消息**（付款超时取消、预约提醒）
-- 需要**每个消息独立确认**（任务分发，每条消息状态独立）
-- 服务间调用需要**消息优先级**
-- 小规模团队，需要**低运维复杂度**
-
-**必须用 Kafka 的场景：**
-- **高吞吐**（日处理百亿+条消息）
-- **数据管道**（MySQL CDC → 数据湖 / ES）
-- **事件驱动架构**（Event Sourcing + CQRS）
-- **流处理**（实时聚合、Join、窗口计算）
-- **长期数据保留**（回溯消费、审计追踪）
-- Replay / 重放能力（偏移量重置）
-
-**核心观点：**
-- RabbitMQ 是**消息代理**（Message Broker）— 将消息投递给正确的消费者，投递完成后通常可以删除
-- Kafka 是**流式存储平台**（Streaming Platform）— 长期保存消息，支持回溯消费
-- 两者不是完全的替代关系，混合使用是常见架构
+**ksqlDB 查询：** Pull Query（点查物化视图）、Push Query（持续推送）、Persistent Query（结果写回 Topic）。
 
 ---
 
-## 附录：参数速查表
+# 附录 B · 高频面试题库（分级）
 
-### 生产者端关键参数
+> 正文各节已穿插标注 **【面试】** 题，本附录按经验层级汇总 20 道高频综合题，便于面试前突击。
+
+## 基础篇（3 年以下）
+
+**Q1. Kafka 为什么这么快？**
+顺序写（600MB/s vs 随机写 100KB/s）+ Page Cache（避免 GC）+ 零拷贝 sendfile（2 次 DMA、0 次 CPU 拷贝）+ 稀疏索引（小可常驻内存）+ 批量 + 压缩。
+
+**Q2. ISR、OSR、AR 的关系？**
+`AR = ISR + OSR`。ISR 是与 Leader 同步的副本（含 Leader），准入条件是 `replica.lag.time.max.ms` 内持续 fetch 并追上 LEO。只有 ISR 能选新 Leader（`unclean.leader.election.enable=false`）。
+
+**Q3. acks=0/1/all 的区别与适用场景？**
+0 不等确认（可能丢，日志采集）；1 Leader 写入即确认（默认折中）；all ISR 全确认（最高可靠，配 `min.insync.replicas>=2`）。
+
+**Q4. Producer 如何保证不丢消息？**
+`acks=all` + `retries=MAX` + `enable.idempotence=true` + 回调处理失败 + 合理 `delivery.timeout.ms`。
+
+**Q5. Rebalance 触发条件？**
+消费者数量变化、分区数增加、订阅 Topic 变更、心跳超时（`session.timeout.ms`）、消费超时（`max.poll.interval.ms`）。
+
+## 进阶篇（3-5 年）
+
+**Q6. HW 和 LEO 是什么？HW 如何更新？**
+LEO = 下一条待写入 offset；HW = ISR 全部副本都同步到的 offset，消费者只能读 HW 之前。`HW = min(ISR 所有副本 LEO)`。
+
+**Q7. Leader Epoch 解决了什么？**
+解决纯 HW 机制的数据丢失/错乱。每个 Leader 任期分配递增 epoch + 记录起始 offset，副本重启后先问 Leader 该 epoch 的最新 offset 再决定是否截断。
+
+**Q8. 幂等 Producer 原理与局限？**
+`<PID, Partition, SeqNo>` 三元组去重。局限：只单会话单分区、Producer→Broker 间、重启后 PID 变失效，跨分区需事务。
+
+**Q9. Kafka 事务的两阶段提交？**
+注册 `transactional.id` → Coordinator 分配 PID+epoch → Phase1 写消息标记未提交 + 写 `__transaction_state` → Phase2 写 COMMIT/ABORT Marker。消费端 `read_committed` 按 Marker 过滤，LSO 标记第一条未提交消息。
+
+**Q10. 粘性分区/CooperativeSticky 的原理与优势？**
+Rebalance 时尽量保留已有分配，只重分配需平衡的分区，实现增量重平衡，减少 STW 与重复消费。2.4+ 默认。
+
+**Q11. read_committed 下卡住的事务有什么影响？**
+长时间未提交事务使 LSO 不推进，阻塞消费端。`transaction.timeout.ms`（默认 60s）超时后 Coordinator 自动 abort。
+
+## 高级篇（5 年以上 / 架构师）
+
+**Q12. 消息不丢失需要从哪几个维度保证？**
+Producer（acks=all + 幂等 + retries + 回调）、Broker（replication>=3 + min.insync>=2 + unclean=false）、Consumer（手动提交 + 先处理再提交 + 业务幂等）。注意 `acks=all` 但 `min.insync=1` 仍会丢。
+
+**Q13. 零拷贝细节？为什么读取不用 mmap？mmap 用在哪？**
+`FileChannel.transferTo` → `sendfile`，数据全程内核态。读取不用 mmap：mmap 受地址空间限制、有缺页中断抖动、未真正消除 CPU 拷贝。mmap 用于索引文件的随机读写。
+
+**Q14. 10 Broker、5 分区、replication=3 的副本分布与 Leader 选举？**
+每分区 3 副本分布在不同 Broker（有机架感知则跨机架）；AR 第一个为 Preferred Leader；Leader 宕机由 Controller 从 ISR 选新 Leader；ISR 空且 unclean=false 则分区不可用。
+
+**Q15. 分区数过多为什么影响性能？如何规划？**
+文件句柄暴涨、选举时间变长、内存开销、Leader 切换延迟（Controller 瓶颈）。规划：`Max(吞吐/单分区能力, 消费者线程数)`，单分区约 10MB/s，每 Broker 100~200 分区，取 Broker 数整数倍。
+
+**Q16. 消息积压排查与解决？**
+排查：`kafka-consumer-groups --describe` 看 Lag → 判断消费能力还是阻塞 → 查消费者资源/下游瓶颈。解决：扩消费者（≤分区数）、增大拉取量、批量/异步处理、优化业务、必要时跳过非关键消息。
+
+**Q17. KRaft 相比 ZK 的优势与选举区别？**
+架构简化、故障检测百毫秒级、元数据同步快、支持 200 万分区、运维简单。选举：ZK 临时节点+Watcher → Raft 多数派共识，避免脑裂。
+
+**Q18. 如何设计 Exactly-Once 流处理管道（Kafka→Flink→Kafka）？**
+生产端幂等+事务，消费端 read_committed+手动提交；Flink `CheckpointingMode.EXACTLY_ONCE` 或 Kafka Streams `processing.guarantee=EXACTLY_ONCE_V2`；两阶段提交 Sink。注意外部系统仍需业务幂等，EOS 有 30~50% 吞吐开销。
+
+**Q19. 集群滚动升级的步骤与注意事项？**
+关自动均衡 → 逐台关停等 Leader 切换 → 升级重启 → 确认 ISR → 重复 → 开自动均衡。注意 RPC 兼容、先 Broker 后客户端、保留回滚包、KRaft 元数据版本。
+
+**Q20. 如何理解流表二象性？在 Kafka Streams/ksqlDB 中如何体现？**
+Stream（仅追加事件序列）与 Table（可变键值视图）可互转。KStream/KTable/GlobalKTable，ksqlDB 的 `CREATE STREAM` vs `CREATE TABLE`。
+
+## 生产踩坑 Top 10
+
+1. 分区数拍脑袋定 → 并行度无法扩展
+2. 重试未开幂等 → ACK 超时重试导致重复
+3. `acks=all` 但 `min.insync.replicas=1` → ISR 只剩 Leader 仍丢
+4. 自动提交 offset → Rebalance 导致重复/丢失
+5. 处理时间 > `max.poll.interval.ms` → 消费超时→Rebalance 恶性循环
+6. Topic 未隔离 → 实时与离线混用互相影响
+7. 未监控 Lag → 积压到磁盘爆满才发现
+8. 分区倾斜 → Key 分布不均致部分 Broker 过热
+9. JVM 堆过大（>16G）→ GC 停顿致心跳超时被踢
+10. KRaft 元数据与数据共用磁盘 → IO 争抢致性能抖动
+
+---
+
+# 附录 C · 参数速查表
+
+### 生产者关键参数
 
 ```properties
 bootstrap.servers=broker1:9092,broker2:9092,broker3:9092
 key.serializer=org.apache.kafka.common.serialization.StringSerializer
 value.serializer=org.apache.kafka.common.serialization.StringSerializer
 
-# 可靠性
-acks=all                   # -1 同义，所有副本确认
-enable.idempotence=true    # 开启幂等
-max.in.flight.requests.per.connection=5  # 幂等下仍可保证有序
+# 可靠性（金融级）
+acks=all
+enable.idempotence=true
+retries=2147483647
+max.in.flight.requests.per.connection=5   # 幂等下仍保证单分区有序
 
 # 吞吐
-batch.size=131072          # 128KB
-linger.ms=10               # 10ms 等待积累批次
-compression.type=snappy    # 或 lz4, zstd
-buffer.memory=67108864     # 64MB
+batch.size=65536            # 64KB
+linger.ms=10
+compression.type=lz4        # 或 zstd
+buffer.memory=134217728     # 128MB
 
 # 超时
 request.timeout.ms=30000
 delivery.timeout.ms=120000
 ```
 
-### 消费者端关键参数
+### 消费者关键参数
 
 ```properties
 bootstrap.servers=broker1:9092,broker2:9092
+group.id=my-consumer-group
 key.deserializer=org.apache.kafka.common.serialization.StringDeserializer
 value.deserializer=org.apache.kafka.common.serialization.StringDeserializer
-group.id=my-consumer-group
 
 # 偏移量
-enable.auto.commit=false     # 手动提交（推荐）
-auto.offset.reset=earliest   # 或 latest, none
-isolation.level=read_committed  # 事务场景
+enable.auto.commit=false
+auto.offset.reset=earliest
+isolation.level=read_committed   # 事务场景
 
 # 吞吐
-max.poll.records=500          # 单次 poll 最大条数
-fetch.min.bytes=65536         # 64KB 最小拉取量
-fetch.max.wait.ms=500         # 等待时间
+max.poll.records=500
+fetch.min.bytes=524288           # 512KB
+fetch.max.wait.ms=500
 
 # 重平衡
 session.timeout.ms=45000
-heartbeat.interval.ms=3000
+heartbeat.interval.ms=15000      # ≈ session.timeout / 3
 max.poll.interval.ms=300000
 partition.assignment.strategy=org.apache.kafka.clients.consumer.CooperativeStickyAssignor
 ```
 
-### Broker 端关键参数
+### Broker 关键参数
 
 ```properties
-# 基础
 broker.id=1
-log.dirs=/data/kafka/data
+log.dirs=/data1/kafka,/data2/kafka   # 多磁盘
 num.network.threads=3
 num.io.threads=8
 
@@ -1539,23 +1442,50 @@ unclean.leader.election.enable=false
 replica.lag.time.max.ms=30000
 
 # 存储
-log.segment.bytes=1073741824    # 1GB
-log.retention.hours=168         # 7 天
-log.retention.bytes=-1          # 无限
-log.cleanup.policy=delete       # 或 compact
-
-# 网络
-socket.send.buffer.bytes=102400
-socket.receive.buffer.bytes=102400
-queued.max.requests=500
+log.segment.bytes=1073741824         # 1GB
+log.retention.hours=168              # 7 天
+log.retention.bytes=-1
+log.cleanup.policy=delete            # 或 compact
 
 # 压缩
-compression.type=producer
+compression.type=producer            # 沿用 Producer 压缩，避免重压缩
 
-# Controller
-controller.quorum.voters=1@controller1:9093,2@controller2:9093,3@controller3:9093
+# Controller（KRaft）
+controller.quorum.voters=1@c1:9093,2@c2:9093,3@c3:9093
 ```
+
+### OS / JVM 速查
+
+| 维度 | 建议 |
+|------|------|
+| JVM 堆 | `-Xms6G -Xmx6G`（留内存给 Page Cache） |
+| GC | `-XX:+UseG1GC -XX:MaxGCPauseMillis=20` |
+| 磁盘 | SSD/NVMe，XFS，`noatime`，RAID10 |
+| 内核 | `vm.swappiness=1`，增大 `vm.max_map_count` |
+| 文件句柄 | `ulimit -n 100000` |
 
 ---
 
-> 撰写说明：本文内容基于 Apache Kafka 3.x 版本特性。Kafka 版本迭代较快（尤其是 KRaft 模式），请以官方文档为准。持续关注 [KIP（Kafka Improvement Proposals）](https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Improvement+Proposals) 获取最新演进。
+# 附录 D · 参考资源
+
+### 官方资料
+- [Apache Kafka 官方文档](https://kafka.apache.org/documentation/)
+- [Confluent 官方文档](https://docs.confluent.io/platform/current/overview.html)
+- [Kafka Improvement Proposals (KIPs)](https://cwiki.apache.org/confluence/display/KAFKA/Kafka+Improvement+Proposals)
+
+### 推荐书籍
+- 《Kafka: The Definitive Guide》（第 2 版）— Neha Narkhede 等
+- 《深入理解 Kafka：核心设计与实践原理》— 朱忠华
+- 《Apache Kafka 源码剖析》— 徐郡明
+- 《Mastering Kafka Streams and ksqlDB》— Mitch Seymour
+
+### 视频教程
+- B 站《企业级消息队列 Kafka 教程，从入门到进阶实战》（本文目录结构参考）
+
+### 站内关联文档
+- [`deep-dive/kafka-internals-deep-dive.md`](./deep-dive/kafka-internals-deep-dive.md) — 源码级存储引擎与副本协议深度解析
+- [`05-rabbitmq-advanced.md`](./05-rabbitmq-advanced.md) — RabbitMQ 对照阅读
+
+---
+
+> 撰写说明：本文基于 Apache Kafka 3.x 版本特性，按 B 站 Kafka 教程目录（kfk1-1 ~ kfk2-9）组织正文，服务端原理与运维内容暂置于附录 A，待目录补全后对齐章节。Kafka 迭代较快（尤其 KRaft），请以官方文档为准。
